@@ -1,0 +1,111 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use IO::Pty;
+use IO::Select;
+use POSIX qw(setsid WNOHANG);
+use Term::ReadKey;
+use Term::Size;
+
+my $restore_done = 0;
+sub cleanup {
+    return if $restore_done++;
+    eval { ReadMode('restore') };
+}
+
+END { cleanup() }
+
+die "Usage: $0 command [args...]\n" unless @ARGV;
+
+my $pty = IO::Pty->new() or die "pty: $!";
+pipe(my $sig_r, my $sig_w) or die "pipe: $!";
+
+my $pid = fork();
+die "fork: $!" unless defined $pid;
+
+if ($pid == 0) {
+    close $sig_r;
+    close $sig_w;
+    my $slave = $pty->slave();
+    setsid() or die "setsid: $!";
+    ioctl($slave, 0x540E, 0);
+    open(STDIN,  '<&', $slave) or die $!;
+    open(STDOUT, '>&', $slave) or die $!;
+    open(STDERR, '>&', $slave) or die $!;
+    exec @ARGV or die "exec: $!";
+}
+
+sub write_all {
+    my ($fh,$buf)=@_;
+    while (length $buf) {
+        my $n=syswrite($fh,$buf);
+        if(!defined $n){ next if $!{EINTR}; die "write: $!"; }
+        substr($buf,0,$n,'');
+    }
+}
+
+sub sync_window_size {
+    my ($cols,$rows)=Term::Size::chars(*STDIN);
+    return unless $cols && $rows;
+    my $ws=pack('S4',$rows,$cols,0,0);
+    ioctl($pty,0x5414,$ws);
+}
+
+sync_window_size();
+
+$SIG{CHLD}=sub { syswrite($sig_w,'C') if defined fileno($sig_w); };
+$SIG{WINCH}=sub { syswrite($sig_w,'W') if defined fileno($sig_w); };
+
+for my $sig (qw(INT TERM QUIT TSTP CONT HUP)) {
+    $SIG{$sig}=sub { kill $sig => -$pid; };
+}
+
+ReadMode('raw');
+
+my $sel = IO::Select->new();
+$sel->add(*STDIN);
+$sel->add($pty);
+$sel->add($sig_r);
+
+MAIN: while (1) {
+    my @ready = $sel->can_read();
+    for my $fh (@ready) {
+        if (fileno($fh) == fileno($sig_r)) {
+            my $events='';
+            sysread($sig_r,$events,1024);
+            for my $e (split //,$events) {
+                if ($e eq 'C') {
+                    my $r=waitpid($pid,WNOHANG);
+                    last MAIN if $r == $pid;
+                } elsif ($e eq 'W') {
+                    sync_window_size();
+                    kill WINCH => -$pid;
+                }
+            }
+            next;
+        }
+
+        if (fileno($fh) == fileno(STDIN)) {
+            my $buf='';
+            my $n=sysread(STDIN,$buf,8192);
+            next unless defined $n && $n > 0;
+            $buf =~ s/a//g;
+            $buf =~ s/\x03//g; # Ctrl-C
+            # $buf =~ s/\x1A//g; # Ctrl-Z
+            write_all($pty,$buf) if length $buf;
+            next;
+        }
+
+        if (fileno($fh) == fileno($pty)) {
+            my $buf='';
+            my $n=sysread($pty,$buf,8192);
+            last MAIN if defined($n) && $n == 0;
+            next unless defined $n && $n > 0;
+            write_all(*STDOUT,$buf);
+        }
+    }
+}
+
+cleanup();
+waitpid($pid,0);
+exit 0;
