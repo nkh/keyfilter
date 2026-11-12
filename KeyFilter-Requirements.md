@@ -1,387 +1,382 @@
-# KeyFilter Requirements Draft
+# KeyFilter Requirements
 
 ## Goal
 
-KeyFilter is a PTY-based wrapper that launches a child process and filters, remaps, records, injects, and observes terminal input before it reaches the child.
+KeyFilter is a PTY-based wrapper that launches a child process and filters, transforms, records, injects, and observes terminal input before it reaches the child.
 
-The project should remain:
+Design goals:
 
 - Unix-friendly
+- single-file implementation
 - dependency-light
-- configuration-file friendly
+- human-readable configuration
 - scriptable with grep/sed/awk
-- usable interactively
+- configuration, command-line, and runtime control share the same command language
+
+---
+
+# Core Model
+
+Everything is a profile.
+
+Active configuration is built from an ordered list:
+
+1. User-selected profiles
+2. `keyfilter_command_line`
+3. `keyfilter_runtime`
+
+`keyfilter_command_line` is generated from command-line options.
+
+`keyfilter_runtime` is generated from commands received over the control socket.
+
+Whenever profiles are enabled or disabled, the active rule set is rebuilt from the active profile list.
 
 ---
 
 # Key Specifications
 
-Supported forms:
-
 ## Named keys
-
-- a
-- A
-- Enter
-- Tab
-- Esc
-- Up
-- Down
-- Left
-- Right
-- Home
-- End
-- PgUp
-- PgDn
-- F1..F12
-
-## Modifiers
 
 Examples:
 
-- C-a
-- M-a
-- M-S-a
-- C-M-a
-- M-Up
-- C-M-S-F5
+    a
+    A
+    Enter
+    Tab
+    Esc
+    Up
+    Down
+    Left
+    Right
+    Home
+    End
+    PgUp
+    PgDn
+    F1
+    F12
+
+## Modifier syntax
+
+Examples:
+
+    C-a
+    M-a
+    S-Tab
+    M-S-a
+    C-M-a
+    C-M-S-F5
 
 Modifiers:
 
 - C = Ctrl
-- M = Alt / Meta
+- M = Alt/Meta
 - S = Shift
 
 Order does not matter.
+
+Examples:
+
+    C-M-a
+    M-C-a
+
+are equivalent.
 
 ## Raw sequences
 
 Examples:
 
-- 1b5b41
-- \x1b\x5b\x41
-
-Discovery mode should display sequences in a format that can be copied directly into configuration.
+    1b5b41
+    \x1b\x5b\x41
 
 ---
 
 # Discovery Mode
 
-Example:
-
-    keyfilter --discover
-
-Shows:
-
-- Friendly name when known
-- Raw bytes
-- Hex dump
-
 Purpose:
 
-- Learn terminal-specific escape sequences
-- Build custom filters
-- Create mappings for uncommon keys
+- learn what the terminal sends
+- discover terminal-specific sequences
+- build filters and mappings
+
+Example output:
+
+    Key      : Up
+    Sequence : 1b 5b 41
+
+Discovery output is intended for humans.
 
 ---
 
-# Blocking
+# Commands
+
+## block
+
+    block C-z
+
+Blocks a key.
+
+## unblock
+
+    unblock C-z
+
+Re-enables a blocked key.
+
+## map
 
 Examples:
 
-    --block C-z
-    --block M-F4
-    --block-code 1b5b313b3241
+    map a=b
 
-Rules are processed through a normalized internal representation.
+    map F1=git status\n
+    map F1=<<Enter>>
+
+    map F1=abc<<Enter>><<C-a>>
+
+A map replaces a matching key with a sequence of characters and/or key symbols.
+
+There is no separate macro command.
+
+A long replacement is simply a map.
 
 ---
 
-# Unblocking
+# Rule Evaluation
+
+All matching rules are evaluated.
+
+Rules are evaluated in declaration order.
+
+Every rule sees the ORIGINAL input key.
+
+Example:
+
+    map a=b
+    map b=c
+
+Typing:
+
+    a
+
+Produces:
+
+    b
+
+not:
+
+    c
+
+because transforms never chain.
+
+## Blocking example
+
+Rules:
+
+    block a
+    map a=b
+    unblock a
+
+Typing:
+
+    a
+
+Produces:
+
+    b
+
+Reason:
+
+- block marks the key as blocked
+- map sets replacement to b
+- unblock re-enables the key
+- final output is allowed
+
+## Multiple mappings
+
+Rules:
+
+    map a=b
+    map a=c
+
+Typing:
+
+    a
+
+Produces:
+
+    c
+
+The last matching map wins.
+
+---
+
+# Startup Injection
+
+Special commands are stored separately from rules.
 
 Examples:
 
-    --unblock C-z
+    startup-delay 500ms
 
-Command-line rules override profile rules.
+    send-startup source env.sh\n
+    send-startup make\n
+After the startup delay expires, startup actions are executed in declaration order.
 
 ---
 
-# Mapping
+# Profiles
+
+## User directory
+
+    ~/.config/keyfilter/
+
+## Socket directory
+
+    ~/.config/keyfilter/sockets/
+
+## Profile lookup
+
+If a profile name contains a path separator, it is loaded directly.
 
 Examples:
 
-    --map M-b=C-t
-    --map Up=Down
-    --map F1=Enter
+    ./local.profile
+    ../test.profile
 
-Any valid key specification may be used on either side.
+Otherwise KeyFilter loads:
 
-Mappings operate on normalized byte sequences.
-
----
-
-# Macros
+    ~/.config/keyfilter/<name>.profile
 
 Example:
 
-    --macro F5='git status\n'
+    profile vim
 
-When F5 is pressed, the text is injected into the child process.
+loads:
 
-Macros are active while the session is running.
+    ~/.config/keyfilter/vim.profile
 
----
-
-# Automatic Startup Injection
-
-New feature.
-
-Example:
-
-    --send-startup 'source env.sh\n'
-
-or
-
-    --send-startup-file init.txt
-
-Purpose:
-
-Automatically type characters into the child process as soon as possible.
-
-Because some programs are not ready immediately after exec(), support:
-
-    --startup-delay 250ms
-    --startup-delay 1s
-
-Multiple startup injections should be allowed.
+Missing profiles are fatal errors.
 
 ---
 
-# Recording
+# Includes
 
 Example:
 
-    --record session.log
+    include common.profile
 
-Capture:
+Included files may include other files.
+
+A file is loaded at most once.
+
+If a file was already loaded:
+
+    ignore it
+
+and continue.
+
+This prevents include loops automatically.
+
+---
+
+# Toggle Profiles
+
+Examples:
+
+    toggle gaming
+
+If profile gaming is active:
+
+    deactivate it
+
+Otherwise:
+
+    activate it at its original position
+
+Rebuilding preserves profile ordering.
+
+---
+
+# Runtime Control
+
+Every instance creates:
+
+    ~/.config/keyfilter/sockets/<pid>.sock
+
+and optionally:
+
+    ~/.config/keyfilter/sockets/<pid>.info
+
+A socket file alone does not guarantee the process still exists.
+
+The PID must be validated before communication.
+
+## Protocol
+
+One command per line.
+
+Examples:
+
+    block C-z
+    map F1=<<Enter>>
+    toggle gaming
+    send abc<<Enter>>
+
+Commands use the same language as profile files.
+
+No JSON.
+No YAML.
+No responses are currently sent.
+
+---
+
+# Runtime Rules
+
+Runtime commands are appended to profile:
+
+    keyfilter_runtime
+
+Command-line commands are appended to profile:
+
+    keyfilter_command_line
+
+Active order:
+
+    profiles
+    keyfilter_command_line
+    keyfilter_runtime
+
+Runtime commands affect only the running instance.
+
+They never modify profile files.
+
+They disappear when KeyFilter exits.
+
+---
+
+# Recording and Replay
+
+Recordings contain:
 
 - timestamps
 - input
 - output
 - child exit code
 
----
+Replay can run:
 
-# Replay
-
-Examples:
-
-    --replay session.log
-    --replay-fast session.log
-
-Replay previously recorded sessions.
+- with recorded timing
+- as fast as possible
 
 ---
 
-# Profiles
+# Error Policy
 
-User configuration directory:
+The following conditions are fatal:
 
-    ~/.config/keyfilter/
+- unknown key specification
+- unknown command
+- missing profile
+- invalid mapping cycle
+- invalid syntax
 
-System configuration directory:
-
-    /etc/keyfilter/
-
-Lookup order:
-
-1. user profile
-2. system profile
-
-Examples:
-
-    --profile vim
-    --profile work
-
----
-
-# Multiple Profiles
-
-Example:
-
-    --profile common
-    --profile laptop
-    --profile vim
-
-Profiles are loaded in order.
-
-Later values override earlier values.
-
----
-
-# Include Directive
-
-Inside a profile:
-
-    include common.profile
-
-Allow rule reuse.
-
-Circular includes should be detected.
-
----
-
-# Aliases
-
-Example:
-
-    alias Leader M-Space
-
-Then:
-
-    block Leader
-
-Aliases are expanded before rule processing.
-
----
-
-# Toggle Rules (Expanded Design)
-
-This is one of the most interesting ideas.
-
-Example:
-
-    toggle M-F12 gaming
-
-A toggle activates or deactivates a named rule set while the child keeps running.
-
-A rule group is a file containing a set of rules in the same format as a profile.
-
-Example rule group:
-
-block C-z
-map j=Down
-map k=Up
-
-Pressing M-F12:
-
-- enables the group if disabled
-- disables it if enabled
-
-Potential uses:
-
-- temporarily disable mappings
-- switch between vim/emacs layouts
-- gaming mode
-- debugging mode
-- emergency pass-through mode
-
-# Toggle all rules
-
-Example:
-
-    toggle M-F11 all-rules
-
-pressing M-F11 disables all rules, and pressing it again re-enables them.
-
----
-
-# One-Shot Mappings
-
-Example:
-
-    map-next F6 Enter
-
-Meaning:
-
-The next time F6 is pressed it becomes Enter.
-
-Then the rule disappears.
-
-Useful for:
-
-- confirmations
-- login automation
-- setup wizards
-- temporary overrides
-
----
-
-# Macro Recording
-
-## via keyfilterctl
-
-Example:
-
-    keyfilterctrl record-macro --start-stop F5
-
-Meaning:
-
-Record a macro until F5 is pressed; then print the macro to stdout.
-
-## while running keyfilter
-
-Example:
-
-    keyfilter --record-macro F5 --macro-to-stdout --macro-prefix space-m
-
-
-Meaning:
-
-- record a macro when F5 is pressed until F5 is pressed
-- assign the macro to the prefix space-m-index, where index is the number of saved macro in the session
-- option macro to-stdout prints all the the macros to stdout after the child process exists
-
-# Remote Control
-
-KeyFilter exposes a UNIX socket.
-
-Example:
-
-    ~/.cache/keyfilter/session.ID.sock
-
-External utility:
-
-    keyfilterctl send ID block C-z
-    keyfilterctl send ID unblock C-z
-    keyfilterctl send ID stats
-
-Possible operations:
-
-- block
-- unblock
-- map
-- unmap
-- enable-group
-- disable-group
-- inject-text
-- display-status
-
-This allows live modification without restarting the child process.
-
-'keyfilterctrl ls' list all the running sessions IDs.
-
----
-
-# Profile Format
-
-Simple text.
-
-Example:
-
-    block C-z
-    block M-F4
-
-    map M-j=Down
-    map M-k=Up
-
-    alias Leader M-Space
-
-    include common.profile
-
-No JSON.
-No YAML.
-No external parser.
-
-Designed to be editable using standard Unix tools.
+Errors should be explicit and easy to diagnose.
