@@ -1,0 +1,135 @@
+.\" keyfilterctl(1) -- manual page
+.TH KEYFILTERCTL 1 "November 2026" "KeyFilter 0.01" "User Commands"
+.SH NAME
+keyfilterctl \- control the running instances of keyfilter
+.SH SYNOPSIS
+.B keyfilterctl
+.RB [ \-\-pid
+.IR PID ]
+.I command
+.RI [ arguments ]
+.br
+.B keyfilterctl
+.RB { \-h | \-\-help }
+.SH DESCRIPTION
+.B keyfilterctl
+talks to the instances of
+.BR keyfilter (1)
+that run for the current user, through their sockets in
+.IR ~/.config/keyfilter/sockets .
+.PP
+It is the same file as
+.BR keyfilter ,
+started under the name
+.BR keyfilterctl .
+A symbolic link is enough:
+.PP
+.RS
+.nf
+ln \-s keyfilter keyfilterctl
+.fi
+.RE
+.PP
+The commands that talk to one instance use the only one that runs, or the one chosen with
+.BR \-\-pid .
+An instance is a socket whose process is alive.
+A socket left by a process that is gone is ignored.
+.PP
+No answer comes back from the instance.
+.B keyfilterctl
+tells that the command was handed over, not that it was used.
+A command is checked before it is sent, a mistake in it is a usage error and nothing is sent.
+.SH OPTIONS
+.TP
+.BR \-p ", " \-\-pid " \fIPID\fR"
+The instance to talk to.
+.TP
+.BR \-h ", " \-\-help
+Show the usage.
+.PP
+The options come before the command.
+.SH COMMANDS
+.TP
+.B ls
+List the instances, one per line: the pid, a space and the command the instance runs.
+The instances are sorted by pid.
+An instance without information has the command
+.BR (unknown) .
+Nothing is printed when no instance runs.
+.TP
+.BI send " TEXT"
+Send text to the command of the instance.
+The text is written like the replacement of a map, see
+.BR keyfilter (1):
+.BR \en ,
+.BR \et ,
+.BR \ee ,
+.BI \ex HH
+and keys between
+.B <<
+and
+.BR >> .
+Several arguments are joined with a space.
+Spaces at the start are not kept, write
+.BR \ex20 .
+A
+.B #
+starts a comment, write
+.BR \e# .
+The text cannot contain a line end, write
+.BR \en .
+.TP
+.BI toggle " PROFILE"
+Turn a profile on if it is off and off if it is on.
+It is a name or a path, without a space or a
+.BR # .
+The names
+.B keyfilter_runtime
+and
+.B keyfilter_command_line
+are refused.
+A profile that the instance does not have is loaded and put after the others.
+A profile that comes back is where it was.
+If it cannot be loaded the instance goes on with the profiles it had.
+.TP
+.BI block " KEYS"
+.TQ
+.BI unblock " KEYS"
+.TQ
+.BI map " KEY=REPLACEMENT"
+Add a rule to the runtime profile of the instance.
+It applies to the keys typed after it, and comes after the rules of the profiles and of the command line.
+The arguments are joined with a space and used as the argument of the command of the same name of a profile.
+.SH EXIT STATUS
+.TP
+.B 0
+The command was done, or handed over.
+.TP
+.B 1
+The command line is wrong, or the text of the command is not valid.
+.TP
+.B 2
+No instance can be reached: none runs, several run and no pid was given, the pid is not an instance, or the connection failed.
+.SH EXAMPLES
+.nf
+keyfilterctl ls
+keyfilterctl send \(aqabc<<Enter>>\(aq
+keyfilterctl toggle gaming
+keyfilterctl block C\-z
+keyfilterctl map F5=\(aqgit status\en\(aq
+keyfilterctl \-\-pid 4242 unblock C\-z
+.fi
+.SH FILES
+.TP
+.I ~/.config/keyfilter/sockets/PID.sock
+.TQ
+.I ~/.config/keyfilter/sockets/PID.info
+The socket and the information of an instance.
+.SH ENVIRONMENT
+.TP
+.B HOME
+Where the sockets are.
+.SH AUTHOR
+Nadim Khemir <nadim.khemir@gmail.com>
+.SH SEE ALSO
+.BR keyfilter (1)

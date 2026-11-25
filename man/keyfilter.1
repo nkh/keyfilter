@@ -1,0 +1,508 @@
+.\" keyfilter(1) -- manual page
+.TH KEYFILTER 1 "November 2026" "KeyFilter 0.01" "User Commands"
+.SH NAME
+keyfilter \- run a program in a pseudo terminal and filter the keys typed to it
+.SH SYNOPSIS
+.B keyfilter
+.RI [ options ]
+.RB [ \-\- ]
+.I command
+.RI [ argument ...]
+.br
+.B keyfilter \-\-discover
+.br
+.B keyfilter \-\-replay
+.I file
+.RB [ \-\-fast ]
+.br
+.B keyfilter
+.RB { \-h | \-\-help | \-\-version }
+.SH DESCRIPTION
+.B keyfilter
+runs
+.I command
+inside a pseudo terminal and sits between the keyboard and the command.
+What is typed is split into keys.
+Rules decide for each key whether it reaches the command, is blocked, or is replaced by other text and keys.
+The output of the command is shown unchanged.
+.PP
+Rules come from profiles, from options on the command line, and from commands sent to the running instance with
+.BR keyfilterctl (1).
+Every instance creates a socket, so it can be controlled while it runs.
+.PP
+.B keyfilter
+is one file written in Perl.
+It needs the module
+.BR IO::Pty .
+Nothing has to be installed to use it, it runs from where it is.
+.PP
+The first argument that does not start with
+.B \-\-
+begins the command, and so does an argument after
+.BR \-\- .
+Everything after that is for the command, including arguments that look like options.
+.SH OPTIONS
+Options that give rules can be repeated.
+They are used in the order they are given.
+.TP
+.BI \-\-block " KEYS"
+Block the keys.
+.I KEYS
+is one or more key specifications separated by spaces, see
+.BR KEYS .
+Same as the command
+.B block
+of a profile.
+.TP
+.BI \-\-unblock " KEYS"
+Unblock the keys.
+.TP
+.BI \-\-map " KEY=REPLACEMENT"
+Replace
+.I KEY
+by
+.IR REPLACEMENT ,
+see
+.BR REPLACEMENTS .
+.TP
+.BI \-\-profile " NAME"
+Load a profile.
+.I NAME
+is a name, looked for in
+.IR ~/.config/keyfilter ,
+or a path when it contains a slash.
+The profiles are used in the order of the options.
+.TP
+.BI \-\-startup\-delay " MS"
+Wait this many milliseconds after the command was started, then send the startup text.
+The delay is a number of milliseconds, no unit is written.
+If it is given several times the last one is used.
+.TP
+.BI \-\-send\-startup " TEXT"
+Send
+.I TEXT
+to the command at startup, see
+.BR STARTUP .
+.TP
+.BI \-\-record " FILE"
+Record the session in
+.IR FILE ,
+see
+.BR "RECORDING AND REPLAY" .
+.TP
+.BI \-\-replay " FILE"
+Replay a recording on the standard output instead of running a command.
+.TP
+.B \-\-fast
+With
+.BR \-\-replay :
+do not wait for the recorded pauses.
+.TP
+.B \-\-discover
+Show what the keys of the terminal send, see
+.BR DISCOVERY .
+.TP
+.B \-\-no\-socket
+Do not create the control socket.
+.TP
+.BR \-h ", " \-\-help
+Show a summary of the options and exit.
+It is looked for before anything else is checked, so it works whatever else is on the command line.
+.TP
+.B \-\-version
+Show the version and exit.
+.PP
+An option can also be written
+.BI \-\-option= value\fR.
+The value of
+.BR \-\-block ,
+.BR \-\-unblock ,
+.BR \-\-map ,
+.B \-\-startup\-delay
+and
+.B \-\-send\-startup
+is the argument of the command of the same name in a profile, with the same syntax.
+In particular a
+.B #
+starts a comment, a literal one is written
+.BR \e# .
+.SH KEYS
+A key is written as one of the following.
+.TP
+a single character
+.BR a ,
+.BR Z ,
+.BR 7 ,
+.BR ! .
+A
+.B #
+is written
+.BR \e# .
+Space is
+.BR Space .
+.TP
+.BI C\- x
+Control and a character:
+.BR C\-a " to " C\-z ,
+.BR C\-Space ,
+.BR C\-@ ,
+.BR C\-[ ,
+.BR C\-\e ,
+.BR C\-] ,
+.BR C\-^ ,
+.BR C\-_ ,
+.BR C\-? .
+.TP
+.BI M\- x
+Alt (Meta): the key preceded by Escape.
+.TP
+.BI S\- x
+Shift: a letter becomes upper case, special keys get their shifted code.
+.TP
+names
+.BR Enter ,
+.BR Tab ,
+.BR Esc ,
+.BR Space ,
+.BR Backspace ,
+.BR Up ,
+.BR Down ,
+.BR Left ,
+.BR Right ,
+.BR Home ,
+.BR End ,
+.BR Insert ,
+.BR Delete ,
+.BR PgUp ,
+.BR PgDn ,
+.BR F1 " to " F12 .
+.B Return
+and
+.B Escape
+are other names of
+.B Enter
+and
+.BR Esc ,
+.B PageUp
+and
+.B PageDown
+of
+.B PgUp
+and
+.BR PgDn .
+Names are case sensitive.
+.TP
+raw sequences
+Hexadecimal bytes, such as
+.B 1b5b41
+or
+.BR \ex1b\ex5b\ex41 .
+A token that is both a name and hexadecimal is the name:
+.B F1
+is the key, and
+.B f1
+is the byte
+.BR f1 .
+.PP
+The modifiers
+.BR C ,
+.B M
+and
+.B S
+can be combined in any order:
+.BR C\-M\-a ,
+.BR M\-S\-Up ,
+.BR C\-M\-S\-F5 .
+Special keys with modifiers are the sequences that xterm sends.
+A modifier given twice, a modifier that has no meaning for a key, such as
+.BR C\-Enter ,
+and an unknown name are errors.
+For a key that a terminal sends in its own way, use the raw bytes that
+.B \-\-discover
+shows.
+.SH REPLACEMENTS
+The replacement of a map, the text of a startup action and the text of
+.B keyfilterctl send
+are written in the same way.
+Characters are sent as they are, except for the following.
+.TP
+.BI << key >>
+The key, for example
+.B <<Enter>>
+or
+.BR <<C\-a>> .
+.TP
+.B \en \er \et \ee
+Newline, carriage return, tab, escape.
+.TP
+.B \e\e \e< \e#
+A backslash, a
+.BR < ,
+a
+.BR # .
+.TP
+.BI \ex HH
+The byte with this hexadecimal value.
+.PP
+An unknown escape, a key symbol that is not finished and an unknown key are errors.
+.SH PROFILES
+A profile is a text file with one command per line.
+Blank lines are ignored.
+A
+.B #
+starts a comment, which goes to the end of the line.
+Names are looked for in
+.IR ~/.config/keyfilter/NAME.profile .
+A name that contains a slash is a path.
+A profile that cannot be found is an error.
+An error in a profile is reported with the file and the line.
+.TP
+.BI block " KEYS"
+.TQ
+.BI unblock " KEYS"
+.TQ
+.BI map " KEY=REPLACEMENT"
+Rules.
+.TP
+.BI include " FILE"
+Insert the commands of another file where the line is.
+A relative path is relative to the directory of the file that has the line.
+A file is loaded once, a second
+.B include
+of it is ignored, which also ends include loops.
+.TP
+.BI startup\-delay " MS"
+.TQ
+.BI send\-startup " TEXT"
+Startup, see
+.BR STARTUP .
+.PP
+The commands
+.BR send ,
+.B toggle
+and
+.B profile
+are accepted in a profile and do nothing there.
+.SH RULES
+Rules are used in this order: the profiles, in the order they were given, then the rules of the command line, then the rules sent to the running instance.
+.PP
+For each key all the rules that name it are evaluated in the order they were declared.
+A
+.B block
+marks the key as blocked, an
+.B unblock
+marks it as free, a
+.B map
+sets the replacement, the last map wins.
+At the end a blocked key gives nothing, otherwise the replacement is sent, or the key if there is none.
+A key that is blocked and mapped gives nothing until it is unblocked.
+.PP
+Rules are looked at for the key that was typed.
+Maps do not chain: with
+.B map a=b
+and
+.B map b=c
+the key
+.B a
+gives
+.BR b .
+What a map sends is not looked at again.
+.PP
+While there are no rules at all, what is typed goes to the command unchanged and at once.
+Otherwise a key that is a sequence, like
+.BR Up ,
+is one key even if it arrives in pieces.
+A lone Escape is sent after 50 milliseconds, when nothing completes it.
+.SH STARTUP
+The startup delay is counted from the moment the command is started.
+When it is over the startup texts are sent to the command, in the order they were declared: the profiles in order, an included file where its
+.B include
+is, then the command line.
+There is one delay for all the texts, the last
+.B startup\-delay
+wins, wherever it is.
+Without one it is 0.
+Startup texts are sent as they are, rules do not apply to them.
+Text that was typed before the delay is over reaches the command before them.
+If the command has ended when the delay is over nothing is sent.
+.SH RECORDING AND REPLAY
+.B \-\-record
+writes a text file, one event per line, after a first line that gives the format.
+An event is the time, in seconds with six decimals from the creation of the recording, a type and a text:
+.PP
+.nf
+0.000412 O hello\er\en
+0.812030 I ls\en
+1.201553 X 0
+.fi
+.PP
+.B I
+is what the command received, after the rules, with the text of the startup.
+.B O
+is what the command wrote.
+.B X
+is the exit code, the last line.
+The text is printable: characters from space to tilde as they are, a backslash as two, and
+.BR \en ,
+.BR \er ,
+.B \et
+and
+.B \ee
+for the usual controls, any other byte as
+.BI \ex hh
+in lower case.
+.PP
+.B \-\-replay
+writes the recorded output on the standard output at the recorded times, input events are not shown, and exits with the recorded exit code, or 0 if there is none.
+.B \-\-fast
+does not wait.
+A recording that is not valid, for example whose times go back, is an error that names the file and the line.
+.SH DISCOVERY
+.B keyfilter \-\-discover
+reads keys from the terminal and shows each one:
+.PP
+.nf
+Key      : Up
+Sequence : 1b 5b 41
+.fi
+.PP
+A blank line follows each key.
+A key that has no name is shown as
+.BR (unknown) ,
+with its bytes.
+The names are the ones the rules use.
+Discovery stops when the input ends, and when Ctrl\-C is pressed twice in a row.
+Its output is made to be read by a person, and can be used by scripts.
+.SH CONTROL SOCKET
+Every instance creates
+.I ~/.config/keyfilter/sockets/PID.sock
+and an information file
+.I PID.info
+that tells the command, the start time and the profiles.
+The directory and the files are private to the user.
+They are removed when the instance ends.
+.B \-\-no\-socket
+does without.
+If the socket cannot be created keyfilter says so and runs the command anyway.
+.PP
+A client connects and writes lines.
+The language is the one of the profiles, limited to
+.BR block ,
+.BR unblock ,
+.BR map ,
+.B toggle
+and
+.BR send .
+They are used at once, a rule for the keys typed after it.
+.B toggle
+turns a profile on or off, a profile that is not loaded is loaded and put after the others, a profile that comes back is where it was.
+.B send
+sends the text to the command, after what was typed before it.
+No answers are sent.
+A line that is wrong is ignored and kept as an error.
+A line is limited to 65536 bytes.
+Use
+.BR keyfilterctl (1)
+instead of writing to the socket.
+.SH FILES
+.TP
+.I ~/.config/keyfilter/NAME.profile
+Profiles.
+.TP
+.I ~/.config/keyfilter/sockets/PID.sock
+The control socket of an instance.
+.TP
+.I ~/.config/keyfilter/sockets/PID.info
+Information about the instance.
+.SH ENVIRONMENT
+.TP
+.B HOME
+Where the profiles and the sockets are.
+The environment is passed to the command as it is, with its own terminal.
+.SH EXIT STATUS
+.B keyfilter
+exits with the exit code of the command, or 128 plus the number of the signal that ended it.
+.TP
+.B 1
+The command line is wrong.
+.TP
+.B 255
+A profile, a recording or the command could not be used.
+.PP
+The signals INT, TERM, QUIT and HUP sent to keyfilter are sent to the process group of the command.
+A change of the size of the terminal is passed on to the command.
+When the standard input is a terminal it is put in raw mode, and restored at the end.
+.SH EXAMPLES
+Block Ctrl\-Z:
+.PP
+.RS
+.nf
+keyfilter \-\-block C\-z \-\- bash
+.fi
+.RE
+.PP
+Map Alt\-b to Ctrl\-t, and F5 to a command:
+.PP
+.RS
+.nf
+keyfilter \-\-map M\-b=<<C\-t>> \-\- bash
+keyfilter \-\-map F5=\(aqgit status\en\(aq \-\- bash
+.fi
+.RE
+.PP
+Profiles, the later one has the last word:
+.PP
+.RS
+.nf
+keyfilter \-\-profile common \-\-profile vim \-\- vim
+.fi
+.RE
+.PP
+Send a line to a shell after half a second:
+.PP
+.RS
+.nf
+keyfilter \-\-startup\-delay 500 \e
+          \-\-send\-startup \(aqsource env.sh\en\(aq \-\- bash
+.fi
+.RE
+.PP
+Record, and replay without the pauses:
+.PP
+.RS
+.nf
+keyfilter \-\-record session.rec \-\- bash
+keyfilter \-\-replay session.rec \-\-fast
+.fi
+.RE
+.PP
+Find out what a key sends, and use it:
+.PP
+.RS
+.nf
+keyfilter \-\-discover
+keyfilter \-\-map 1b5b31353b3541=x \-\- bash
+.fi
+.RE
+.PP
+The directory
+.I examples
+of the source has scripts that run all of this without a terminal and without installing anything.
+.SH DIAGNOSTICS
+Errors are written on the standard error output, starting with
+.BR keyfilter: .
+An error of an option names the option.
+.SH BUGS
+Two instances in one process are not supported, they share the SIGCHLD handler.
+A terminal that sends a key in a way that
+.B \-\-discover
+does not know shows it as
+.BR (unknown) ,
+use its bytes.
+.SH AUTHOR
+Nadim Khemir <nadim.khemir@gmail.com>
+.SH SEE ALSO
+.BR keyfilterctl (1),
+.BR pty (7),
+.BR termios (3),
+.BR terminal\-colors.d (5)

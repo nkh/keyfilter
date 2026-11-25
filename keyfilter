@@ -1,0 +1,4034 @@
+#!/usr/bin/env perl
+
+use strict ;
+use warnings ;
+
+# -----------------------------------------------------------------------------
+
+package KeyFilter::Key ;
+
+our $VERSION = '0.01' ;
+
+my %SIMPLE =
+	(
+	Enter     => "\r",
+	Return    => "\r",
+	Tab       => "\t",
+	Esc       => "\e",
+	Escape    => "\e",
+	Space     => ' ',
+	Backspace => "\x7f",
+	) ;
+
+my %SPECIAL =
+	(
+	Up       => ['csi', 'A'],
+	Down     => ['csi', 'B'],
+	Right    => ['csi', 'C'],
+	Left     => ['csi', 'D'],
+	Home     => ['csi', 'H'],
+	End      => ['csi', 'F'],
+	Insert   => ['tilde', 2],
+	Delete   => ['tilde', 3],
+	PgUp     => ['tilde', 5],
+	PgDn     => ['tilde', 6],
+	PageUp   => ['tilde', 5],
+	PageDown => ['tilde', 6],
+	F1       => ['ss3', 'P'],
+	F2       => ['ss3', 'Q'],
+	F3       => ['ss3', 'R'],
+	F4       => ['ss3', 'S'],
+	F5       => ['tilde', 15],
+	F6       => ['tilde', 17],
+	F7       => ['tilde', 18],
+	F8       => ['tilde', 19],
+	F9       => ['tilde', 20],
+	F10      => ['tilde', 21],
+	F11      => ['tilde', 23],
+	F12      => ['tilde', 24],
+	) ;
+
+my %MODIFIER_BIT =
+	(
+	S => 1,
+	M => 2,
+	C => 4,
+	) ;
+
+my %NAME_OF ;
+
+# -----------------------------------------------------------------------------
+
+sub parse_key_specs
+{
+my ($text) = @_ ;
+
+return map { parse_key($_) } split(' ', $text) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub parse_key
+{
+my ($spec) = @_ ;
+
+$spec =~ s/\\#/#/g ;
+
+my ($modifiers, $base) = split_modifiers($spec) ;
+
+return char_sequence($modifiers, $base, $spec) if $base =~ /\A[\x21-\x7e]\z/ ;
+
+return simple_sequence($modifiers, $base, $spec) if exists $SIMPLE{$base} ;
+
+return special_sequence($modifiers, $base) if exists $SPECIAL{$base} ;
+
+my $raw = %$modifiers ? undef : raw_sequence($base) ;
+
+return $raw if defined $raw ;
+
+die "unknown key specification '$spec'\n" ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub control_char
+{
+my ($char, $spec) = @_ ;
+
+return "\x7f" if $char eq '?' ;
+
+return chr(ord(uc $char) & 0x1f) if $char =~ /[A-Za-z\@\[\\\]^_]/ ;
+
+die "key specification '$spec' has no control character\n" ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub raw_sequence
+{
+my ($spec) = @_ ;
+
+return pack('H*', $spec) if $spec =~ /\A(?:[0-9a-fA-F]{2})+\z/ ;
+
+return join('', map { chr hex $_ } $spec =~ /\\x([0-9a-fA-F]{2})/g) if $spec =~ /\A(?:\\x[0-9a-fA-F]{2})+\z/ ;
+
+return ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub split_modifiers
+{
+my ($spec) = @_ ;
+
+my ($prefix, $base) = $spec =~ /\A((?:[CMS]-)*)(.+)\z/ ;
+
+($prefix, $base) = ('', $spec) unless defined $base ;
+
+my %modifiers ;
+
+for my $letter ($prefix =~ /([CMS])-/g)
+	{
+	die "duplicate modifier '$letter' in key specification '$spec'\n" if $modifiers{$letter}++ ;
+	}
+
+return (\%modifiers, $base) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub char_sequence
+{
+my ($modifiers, $char, $spec) = @_ ;
+
+if ($modifiers->{S})
+	{
+	die "modifier S needs a letter in key specification '$spec'\n" unless $char =~ /[A-Za-z]/ ;
+	
+	$char = uc $char ;
+	}
+
+$char = control_char($char, $spec) if $modifiers->{C} ;
+
+return $modifiers->{M} ? "\e$char" : $char ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub simple_sequence
+{
+my ($modifiers, $name, $spec) = @_ ;
+
+my %remaining = %$modifiers ;
+my $sequence  = $SIMPLE{$name} ;
+
+$sequence = "\e[Z" if $name eq 'Tab' && delete $remaining{S} ;
+$sequence = "\x00" if $name eq 'Space' && delete $remaining{C} ;
+
+my $meta          = delete $remaining{M} ;
+my ($unsupported) = sort keys %remaining ;
+
+die "modifier $unsupported is not supported for key specification '$spec', use a raw sequence\n" if $unsupported ;
+
+return $meta ? "\e$sequence" : $sequence ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub special_sequence
+{
+my ($modifiers, $name) = @_ ;
+
+my ($kind, $code) = @{$SPECIAL{$name}} ;
+my $parameter     = 1 ;
+
+$parameter += $MODIFIER_BIT{$_} for keys %$modifiers ;
+
+if ($kind eq 'tilde')
+	{
+	return $parameter == 1 ? "\e[$code~" : "\e[$code;$parameter~" ;
+	}
+
+if ($kind eq 'ss3')
+	{
+	return $parameter == 1 ? "\eO$code" : "\e[1;$parameter$code" ;
+	}
+
+return $parameter == 1 ? "\e[$code" : "\e[1;$parameter$code" ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub utf8_length
+{
+my ($buffer) = @_ ;
+
+return 0 unless length $buffer ;
+
+my $lead = ord substr($buffer, 0, 1) ;
+my $need = $lead >= 0xf0 && $lead <= 0xf4 ? 4 : $lead >= 0xe0 && $lead <= 0xef ? 3 : $lead >= 0xc2 && $lead <= 0xdf ? 2 : 1 ;
+
+return 1 if $need == 1 ;
+
+my $have  = length $buffer ;
+my $check = $have < $need ? $have : $need ;
+
+for my $index (1 .. $check - 1)
+	{
+	return 1 unless (ord(substr($buffer, $index, 1)) & 0xc0) == 0x80 ;
+	}
+
+return $have < $need ? 0 : $need ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub csi_length
+{
+my ($buffer) = @_ ;
+
+my $length = length $buffer ;
+my $index  = 2 ;
+
+$index++ while $index < $length && ord(substr($buffer, $index, 1)) >= 0x30 && ord(substr($buffer, $index, 1)) <= 0x3f ;
+$index++ while $index < $length && ord(substr($buffer, $index, 1)) >= 0x20 && ord(substr($buffer, $index, 1)) <= 0x2f ;
+
+return 0 if $index >= $length ;
+
+my $final = ord substr($buffer, $index, 1) ;
+
+return $final >= 0x40 && $final <= 0x7e ? $index + 1 : 1 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub key_length
+{
+my ($buffer) = @_ ;
+
+return 0 unless length $buffer ;
+
+return utf8_length($buffer) unless substr($buffer, 0, 1) eq "\e" ;
+
+return 0 if length $buffer == 1 ;
+
+my $second = substr($buffer, 1, 1) ;
+
+return csi_length($buffer) if $second eq '[' ;
+
+return length $buffer < 3 ? 0 : 3 if $second eq 'O' ;
+
+if ($second eq "\e")
+	{
+	return 0 if length $buffer == 2 ;
+	
+	my $third = substr($buffer, 2, 1) ;
+	
+	return 2 unless $third eq '[' || $third eq 'O' ;
+	
+	my $inner = key_length(substr($buffer, 1)) ;
+	
+	return $inner ? 1 + $inner : 0 ;
+	}
+
+my $inner = utf8_length(substr($buffer, 1)) ;
+
+return $inner ? 1 + $inner : 0 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub split_keys
+{
+my ($buffer) = @_ ;
+
+my @keys ;
+
+while (length $buffer)
+	{
+	my $length = key_length($buffer) ;
+	
+	last unless $length ;
+	
+	push @keys, substr($buffer, 0, $length, '') ;
+	}
+
+return (\@keys, $buffer) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub flush_keys
+{
+my ($remainder) = @_ ;
+
+return length $remainder ? ($remainder) : () ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub candidate_specs
+{
+my @specs ;
+my @printable = map { chr } 0x21 .. 0x7e ;
+my @letters   = ('a' .. 'z') ;
+my @simple    = ('Space', 'Enter', 'Tab', 'Esc', 'Backspace') ;
+my @special   = (sort(grep { /\A(?:Up|Down|Right|Left|Home|End|Insert|Delete|PgUp|PgDn)\z/ } keys %SPECIAL), map { "F$_" } 1 .. 12) ;
+my $escape    = sub { return $_[0] eq '#' ? '\#' : $_[0] ; } ;
+
+push @specs, map { $escape->($_) } @printable ;
+push @specs, @simple ;
+push @specs, map { "C-$_" } @letters, 'Space', '\\', ']', '^', '_', '@', '[', '?' ;
+push @specs, @special ;
+
+for my $mask (1 .. 7)
+	{
+	my $prefix = join('', ($mask & 4 ? 'C-' : ''), ($mask & 2 ? 'M-' : ''), ($mask & 1 ? 'S-' : '')) ;
+	
+	push @specs, map { "$prefix$_" } @special ;
+	}
+
+push @specs, 'S-Tab', 'M-Enter', 'M-Tab', 'M-Esc', 'M-Space', 'M-Backspace', 'C-M-Space', 'M-S-Tab' ;
+push @specs, map { 'M-' . $escape->($_) } @printable ;
+push @specs, map { "C-M-$_" } @letters, '\\', ']', '^', '_' ;
+
+return @specs ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub name_of
+{
+my ($sequence) = @_ ;
+
+if (!%NAME_OF)
+	{
+	for my $spec (candidate_specs())
+		{
+		my $found = eval { parse_key($spec) ; } ;
+		
+		$NAME_OF{$found} //= $spec if defined $found ;
+		}
+	}
+
+return $NAME_OF{$sequence} ;
+}
+
+# -----------------------------------------------------------------------------
+
+package KeyFilter::Replacement ;
+
+our $VERSION = '0.01' ;
+
+my %ESCAPE =
+	(
+	n    => "\n",
+	r    => "\r",
+	t    => "\t",
+	e    => "\e",
+	'\\' => '\\',
+	'<'  => '<',
+	'#'  => '#',
+	) ;
+
+# -----------------------------------------------------------------------------
+
+sub parse_replacement
+{
+my ($text) = @_ ;
+
+my $original = $text ;
+my $output   = '' ;
+
+while (length $text)
+	{
+	if ($text =~ s/\A<<(.*?)>>//s)
+		{
+		$output .= KeyFilter::Key::parse_key($1) ;
+		}
+	elsif ($text =~ s/\A<<//)
+		{
+		die "unterminated key symbol in replacement '$original'\n" ;
+		}
+	elsif ($text =~ s/\A\\x([0-9a-fA-F]{2})//)
+		{
+		$output .= chr hex $1 ;
+		}
+	elsif ($text =~ s/\A\\(.)//s)
+		{
+		$output .= escape_char($1, $original) ;
+		}
+	elsif ($text =~ s/\A\\\z//)
+		{
+		die "trailing backslash in replacement '$original'\n" ;
+		}
+	else
+		{
+		$text =~ s/\A(.)//s ;
+		$output .= $1 ;
+		}
+	}
+
+return $output ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub escape_char
+{
+my ($char, $original) = @_ ;
+
+return $ESCAPE{$char} if exists $ESCAPE{$char} ;
+
+die "unknown escape '\\$char' in replacement '$original'\n" ;
+}
+
+# -----------------------------------------------------------------------------
+
+package KeyFilter::Command ;
+
+our $VERSION = '0.01' ;
+
+my %PARSER =
+	(
+	block           => \&parse_key_command,
+	unblock         => \&parse_key_command,
+	map             => \&parse_map,
+	toggle          => \&parse_name_command,
+	include         => \&parse_name_command,
+	profile         => \&parse_name_command,
+	'startup-delay' => \&parse_startup_delay,
+	'send-startup'  => \&parse_text_command,
+	send            => \&parse_text_command,
+	) ;
+
+my %ARGUMENT_FIELD =
+	(
+	toggle  => 'profile',
+	include => 'file',
+	profile => 'profile',
+	) ;
+
+# -----------------------------------------------------------------------------
+
+sub parse_command
+{
+my ($line) = @_ ;
+
+$line =~ s/\r?\n\z// ;
+
+$line = strip_comment($line) ;
+
+return if $line =~ /\A\s*\z/ ;
+
+my ($name, $argument) = $line =~ /\A\s*(\S+)(?:\s+(.*))?\z/ ;
+
+$argument //= '' ;
+
+my $parser = $PARSER{$name} or die "unknown command '$name'\n" ;
+
+return $parser->($name, $argument) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub strip_comment
+{
+my ($line) = @_ ;
+
+return $line unless $line =~ /\A((?:[^\\#]|\\.)*)#/ ;
+
+my $code = $1 ;
+
+$code =~ s/\s+\z// ;
+
+return $code ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub parse_key_command
+{
+my ($name, $argument) = @_ ;
+
+my @keys = KeyFilter::Key::parse_key_specs($argument) ;
+
+die "$name requires at least one key specification\n" unless @keys ;
+
+return { cmd => $name, keys => \@keys } ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub parse_map
+{
+my ($name, $argument) = @_ ;
+
+my ($trigger, $replacement) = $argument =~ /\A(\S+?)=(.*)\z/ ;
+
+die "invalid syntax, expected: map KEY=REPLACEMENT\n" unless defined $trigger ;
+
+return
+	{
+	cmd         => 'map',
+	key         => KeyFilter::Key::parse_key($trigger),
+	replacement => KeyFilter::Replacement::parse_replacement($replacement),
+	} ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub parse_name_command
+{
+my ($name, $argument) = @_ ;
+
+$argument =~ s/\s+\z// ;
+
+die "$name requires an argument\n" if $argument eq '' ;
+
+return { cmd => $name, $ARGUMENT_FIELD{$name} => $argument } ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub parse_startup_delay
+{
+my ($name, $argument) = @_ ;
+
+$argument =~ s/\s+\z// ;
+
+die "invalid duration '$argument', expected a number of milliseconds\n" unless $argument =~ /\A\d+\z/ ;
+
+return { cmd => $name, ms => $argument + 0 } ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub parse_text_command
+{
+my ($name, $argument) = @_ ;
+
+die "$name requires text\n" if $argument eq '' ;
+
+return { cmd => $name, text => KeyFilter::Replacement::parse_replacement($argument) } ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub parse_commands
+{
+my ($text, $source) = @_ ;
+
+my @commands ;
+my $number = 0 ;
+
+for my $line (split /\n/, $text)
+	{
+	$number++ ;
+	
+	$line =~ s/\r\z// ;
+	
+	my $command = eval { scalar parse_command($line) ; } ;
+	
+	die "$source:$number: $@" if $@ ;
+	
+	next unless $command ;
+	
+	$command->{source} = "$source:$number" ;
+	
+	push @commands, $command ;
+	}
+
+return @commands ;
+}
+
+# -----------------------------------------------------------------------------
+
+package KeyFilter::Rules ;
+
+our $VERSION = '0.01' ;
+
+my %RULE_COMMAND =
+	(
+	block   => 1,
+	unblock => 1,
+	map     => 1,
+	) ;
+
+# -----------------------------------------------------------------------------
+
+sub new
+{
+my ($class) = @_ ;
+
+return bless { rules => [], index => undef }, $class ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub is_rule_command
+{
+my ($command) = @_ ;
+
+return ref($command) eq 'HASH' && exists $RULE_COMMAND{$command->{cmd} // ''} ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub add
+{
+my ($self, $command) = @_ ;
+
+unless (is_rule_command($command))
+	{
+	my $name = ref($command) eq 'HASH' ? ($command->{cmd} // '') : '' ;
+	
+	die "not a rule command '$name'\n" ;
+	}
+
+push @{$self->{rules}}, $command ;
+
+$self->{index} = undef ;
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub rules { return @{$_[0]->{rules}} ; }
+
+# -----------------------------------------------------------------------------
+
+sub count { return scalar @{$_[0]->{rules}} ; }
+
+# -----------------------------------------------------------------------------
+
+sub clear
+{
+my ($self) = @_ ;
+
+$self->{rules} = [] ;
+$self->{index} = undef ;
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub matches
+{
+my ($rule, $key) = @_ ;
+
+return $rule->{key} eq $key if $rule->{cmd} eq 'map' ;
+
+return scalar grep { $_ eq $key } @{$rule->{keys}} ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub build_index
+{
+my ($self) = @_ ;
+
+my %index ;
+
+for my $rule ($self->rules())
+	{
+	my %seen ;
+	
+	for my $key ($rule->{cmd} eq 'map' ? ($rule->{key}) : @{$rule->{keys}})
+		{
+		push @{$index{$key}}, $rule unless $seen{$key}++ ;
+		}
+	}
+
+return \%index ;
+}
+
+#--#
+
+sub matching_rules
+{
+my ($self, $key) = @_ ;
+
+$self->{index} //= $self->build_index() ;
+
+return @{$self->{index}{$key} // []} ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub evaluate
+{
+my ($self, $key) = @_ ;
+
+my %state = (blocked => 0, replacement => undef) ;
+
+for my $rule ($self->matching_rules($key))
+	{
+	if ($rule->{cmd} eq 'map')
+		{
+		$state{replacement} = $rule->{replacement} ;
+		}
+	else
+		{
+		$state{blocked} = $rule->{cmd} eq 'block' ? 1 : 0 ;
+		}
+	}
+
+return \%state ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub process
+{
+my ($self, $key) = @_ ;
+
+my $state = $self->evaluate($key) ;
+
+return '' if $state->{blocked} ;
+
+return defined $state->{replacement} ? $state->{replacement} : $key ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub process_keys
+{
+my ($self, @keys) = @_ ;
+
+return join('', map { $self->process($_) } @keys) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub add_commands
+{
+my ($self, @commands) = @_ ;
+
+for my $command (grep { is_rule_command($_) } @commands)
+	{
+	$self->add($command) ;
+	}
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+package KeyFilter::Profile ;
+
+use Cwd () ;
+use File::Basename () ;
+use File::Spec () ;
+
+our $VERSION = '0.01' ;
+
+my %STARTUP_COMMAND =
+	(
+	'startup-delay' => 1,
+	'send-startup'  => 1,
+	) ;
+
+# -----------------------------------------------------------------------------
+
+sub read_file
+{
+my ($path) = @_ ;
+
+open(my $fh, '<', $path) or die "cannot read '$path': $!\n" ;
+
+local $/ ;
+
+my $text = <$fh> // '' ;
+
+close $fh ;
+
+return $text ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub read_commands
+{
+my ($path, $loaded) = @_ ;
+
+my $canonical = Cwd::abs_path($path) ;
+
+$loaded->{$canonical} = 1 ;
+
+my @commands ;
+
+for my $command (KeyFilter::Command::parse_commands(read_file($path), $path))
+	{
+	if ($command->{cmd} eq 'include')
+		{
+		push @commands, include_commands($command, $path, $loaded) ;
+		}
+	else
+		{
+		push @commands, $command ;
+		}
+	}
+
+return @commands ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub include_commands
+{
+my ($command, $path, $loaded) = @_ ;
+
+my $file = File::Spec->rel2abs($command->{file}, File::Basename::dirname($path)) ;
+
+die "$command->{source}: missing include '$command->{file}'\n" unless -f $file ;
+
+my $canonical = Cwd::abs_path($file) ;
+
+return if $loaded->{$canonical} ;
+
+return read_commands($file, $loaded) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub load
+{
+my ($path, $loaded) = @_ ;
+
+$loaded //= {} ;
+
+die "missing profile '$path'\n" unless -f $path ;
+
+my %profile =
+	(
+	name     => File::Basename::basename($path, '.profile'),
+	path     => $path,
+	commands => [ read_commands($path, $loaded) ],
+	) ;
+
+return bless \%profile, __PACKAGE__ ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub name { return $_[0]->{name} ; }
+
+# -----------------------------------------------------------------------------
+
+sub path { return $_[0]->{path} ; }
+
+# -----------------------------------------------------------------------------
+
+sub commands { return @{$_[0]->{commands}} ; }
+
+# -----------------------------------------------------------------------------
+
+sub rules
+{
+my ($self) = @_ ;
+
+return KeyFilter::Rules->new()->add_commands($self->commands) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub startup
+{
+my ($self) = @_ ;
+
+return grep { exists $STARTUP_COMMAND{$_->{cmd}} } $self->commands ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub config_dir
+{
+my $home = $ENV{HOME} // die "HOME is not set\n" ;
+
+return "$home/.config/keyfilter" ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub find_profile
+{
+my ($name) = @_ ;
+
+my $path = index($name, '/') >= 0 ? $name : config_dir() . "/$name.profile" ;
+
+return $path if -f $path ;
+
+die "missing profile '$name', looked for '$path'\n" ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub load_profiles
+{
+my (@names) = @_ ;
+
+my $loaded = {} ;
+
+return map { load(find_profile($_), $loaded) } @names ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub build_rules
+{
+my (@profiles) = @_ ;
+
+my $rules = KeyFilter::Rules->new() ;
+
+$rules->add_commands($_->commands) for @profiles ;
+
+return $rules ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub build_startup
+{
+my (@profiles) = @_ ;
+
+return map { $_->startup } @profiles ;
+}
+
+# -----------------------------------------------------------------------------
+
+package KeyFilter::Chain ;
+
+use File::Basename () ;
+
+our $VERSION = '0.01' ;
+
+my $COMMAND_LINE = 'keyfilter_command_line' ;
+my $RUNTIME      = 'keyfilter_runtime' ;
+
+my %COMMAND_LINE_COMMAND =
+	(
+	block           => 1,
+	unblock         => 1,
+	map             => 1,
+	'startup-delay' => 1,
+	'send-startup'  => 1,
+	) ;
+
+my %CHAIN_STARTUP_NAME =
+	(
+	'startup-delay' => 1,
+	'send-startup'  => 1,
+	) ;
+
+# -----------------------------------------------------------------------------
+
+sub command_line_name { return $COMMAND_LINE ; }
+
+# -----------------------------------------------------------------------------
+
+sub runtime_name { return $RUNTIME ; }
+
+# -----------------------------------------------------------------------------
+
+sub new
+{
+my ($class, %arguments) = @_ ;
+
+my @profiles     = @{$arguments{profiles} // []} ;
+my @command_line = @{$arguments{command_line} // []} ;
+
+for my $profile (@profiles)
+	{
+	die "not a profile\n" unless Scalar::Util::blessed($profile) && $profile->can('commands') && $profile->can('name') ;
+	
+	die "reserved profile name '" . $profile->name() . "'\n" if $profile->name() eq $COMMAND_LINE || $profile->name() eq $RUNTIME ;
+	}
+
+for my $command (@command_line)
+	{
+	my $name = ref($command) eq 'HASH' ? ($command->{cmd} // '') : '' ;
+	
+	die "not a command line command '$name'\n" unless $COMMAND_LINE_COMMAND{$name} ;
+	}
+
+my %self =
+	(
+	profiles     => \@profiles,
+	active       => { map { $_->name() => 1 } @profiles },
+	command_line => \@command_line,
+	runtime      => [],
+	generation   => 0,
+	cache        => undef,
+	) ;
+
+return bless \%self, $class ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub profiles { return @{$_[0]->{profiles}} ; }
+
+# -----------------------------------------------------------------------------
+
+sub profile_names { return map { $_->name() } $_[0]->profiles() ; }
+
+# -----------------------------------------------------------------------------
+
+sub active_names
+{
+my ($self) = @_ ;
+
+return grep { $self->{active}{$_} } $self->profile_names() ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub find_known
+{
+my ($self, $name) = @_ ;
+
+my ($found) = grep { $_->name() eq $name } $self->profiles() ;
+
+return $found ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub is_known { return $_[0]->find_known($_[1]) ? 1 : 0 ; }
+
+# -----------------------------------------------------------------------------
+
+sub is_active
+{
+my ($self, $name) = @_ ;
+
+return $self->{active}{$name} ? 1 : 0 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub active_profiles
+{
+my ($self) = @_ ;
+
+return map { $self->find_known($_) } $self->active_names() ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub name_of
+{
+my ($argument) = @_ ;
+
+return index($argument, '/') >= 0 ? File::Basename::basename($argument, '.profile') : $argument ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub enable
+{
+my ($self, $argument) = @_ ;
+
+die "no profile name\n" unless defined $argument && length $argument ;
+
+my $name = name_of($argument) ;
+
+die "reserved profile name '$name'\n" if $name eq $COMMAND_LINE || $name eq $RUNTIME ;
+
+if ($self->is_known($name))
+	{
+	return 0 if $self->is_active($name) ;
+	
+	$self->{active}{$name} = 1 ;
+	
+	$self->changed() ;
+	
+	return 1 ;
+	}
+
+my $profile = KeyFilter::Profile::load(KeyFilter::Profile::find_profile($argument), {}) ;
+
+die "reserved profile name '" . $profile->name() . "'\n" if $profile->name() eq $COMMAND_LINE || $profile->name() eq $RUNTIME ;
+
+push @{$self->{profiles}}, $profile ;
+
+$self->{active}{$profile->name()} = 1 ;
+
+$self->changed() ;
+
+return 1 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub disable
+{
+my ($self, $argument) = @_ ;
+
+die "no profile name\n" unless defined $argument && length $argument ;
+
+my $name = name_of($argument) ;
+
+die "reserved profile name '$name'\n" if $name eq $COMMAND_LINE || $name eq $RUNTIME ;
+
+return 0 unless $self->is_active($name) ;
+
+delete $self->{active}{$name} ;
+
+$self->changed() ;
+
+return 1 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub toggle
+{
+my ($self, $argument) = @_ ;
+
+die "no profile name\n" unless defined $argument && length $argument ;
+
+my $name = name_of($argument) ;
+
+if ($self->is_active($name))
+	{
+	$self->disable($name) ;
+	
+	return 'disabled' ;
+	}
+
+$self->enable($argument) ;
+
+return 'enabled' ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub command_line_commands { return @{$_[0]->{command_line}} ; }
+
+# -----------------------------------------------------------------------------
+
+sub runtime_commands { return @{$_[0]->{runtime}} ; }
+
+# -----------------------------------------------------------------------------
+
+sub order
+{
+my ($self) = @_ ;
+
+return ($self->active_names(), $COMMAND_LINE, $RUNTIME) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub add_runtime
+{
+my ($self, $command) = @_ ;
+
+unless (KeyFilter::Rules::is_rule_command($command))
+	{
+	my $name = ref($command) eq 'HASH' ? ($command->{cmd} // '') : '' ;
+	
+	die "not a rule command '$name'\n" ;
+	}
+
+push @{$self->{runtime}}, $command ;
+
+$self->changed() ;
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub commands
+{
+my ($self) = @_ ;
+
+return ((map { $_->commands() } $self->active_profiles()), $self->command_line_commands(), $self->runtime_commands()) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub generation { return $_[0]->{generation} ; }
+
+#--#
+
+sub changed
+{
+my ($self) = @_ ;
+
+$self->{generation}++ ;
+$self->{cache} = undef ;
+
+return $self ;
+}
+
+#--#
+
+sub rebuild
+{
+my ($self) = @_ ;
+
+$self->changed() ;
+
+return $self->rules() ;
+}
+
+#--#
+
+sub rules
+{
+my ($self) = @_ ;
+
+$self->{cache} //= KeyFilter::Rules->new()->add_commands($self->commands()) ;
+
+return $self->{cache} ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub startup
+{
+my ($self) = @_ ;
+
+return KeyFilter::Startup->new(grep { $CHAIN_STARTUP_NAME{$_->{cmd}} } (map { $_->commands() } $self->active_profiles()), $self->command_line_commands()) ;
+}
+
+# -----------------------------------------------------------------------------
+
+package KeyFilter::PTY ;
+
+use Fcntl () ;
+use IO::Select () ;
+use POSIX () ;
+use Scalar::Util () ;
+use Time::HiRes () ;
+
+our $VERSION = '0.01' ;
+
+my @RAW_MODES ;
+
+my %APPLY_METHOD =
+	(
+	block   => 'apply_rule',
+	unblock => 'apply_rule',
+	map     => 'apply_rule',
+	send    => 'apply_send',
+	toggle  => 'apply_toggle',
+	) ;
+
+my %NEEDS_CHAIN =
+	(
+	block   => 1,
+	unblock => 1,
+	map     => 1,
+	toggle  => 1,
+	) ;
+
+my %EVENT_METHOD =
+	(
+	C => 'child_exited',
+	W => 'window_changed',
+	) ;
+
+END
+	{
+	restore_all() ;
+	}
+
+# -----------------------------------------------------------------------------
+
+sub new
+{
+my ($class, %arguments) = @_ ;
+
+my $command = $arguments{command} ;
+
+die "no command to run\n" unless ref($command) eq 'ARRAY' && @$command && defined $command->[0] && length $command->[0] ;
+
+pipe(my $wake_read, my $wake_write) or die "pipe: $!\n" ;
+
+$wake_read->blocking(0) ;
+$wake_write->blocking(0) ;
+
+my %self =
+	(
+	command       => [ @$command ],
+	input         => $arguments{input} // \*STDIN,
+	output        => $arguments{output} // \*STDOUT,
+	filter        => $arguments{filter},
+	on_output     => $arguments{on_output},
+	on_event      => $arguments{on_event},
+	chain         => $arguments{chain},
+	control       => $arguments{control},
+	key_timeout   => $arguments{key_timeout} // 0.05,
+	key_buffer    => '',
+	key_deadline  => undef,
+	command_errors => [],
+	recorder      => $arguments{recorder},
+	startup       => $arguments{startup},
+	on_startup    => $arguments{on_startup},
+	startup_fired => 0,
+	spawned_at    => undef,
+	wake_read     => $wake_read,
+	wake_write    => $wake_write,
+	signals       => {},
+	pid           => undef,
+	master        => undef,
+	exit_code     => undef,
+	pending_input => '',
+	input_eof     => 0,
+	last_sent     => '',
+	raw           => undef,
+	master_closed => 0,
+	output_broken => 0,
+	ran           => 0,
+	) ;
+
+return bless \%self, $class ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub pid { return $_[0]->{pid} ; }
+
+# -----------------------------------------------------------------------------
+
+sub master { return $_[0]->{master} ; }
+
+# -----------------------------------------------------------------------------
+
+sub exit_code { return $_[0]->{exit_code} ; }
+
+# -----------------------------------------------------------------------------
+
+sub input { return $_[0]->{input} ; }
+
+# -----------------------------------------------------------------------------
+
+sub input_eof { return $_[0]->{input_eof} ; }
+
+# -----------------------------------------------------------------------------
+
+sub pending_input { return length $_[0]->{pending_input} ; }
+
+# -----------------------------------------------------------------------------
+
+sub output { return $_[0]->{output} ; }
+
+# -----------------------------------------------------------------------------
+
+sub output_closed { return $_[0]->{master_closed} ; }
+
+# -----------------------------------------------------------------------------
+
+sub output_broken { return $_[0]->{output_broken} ; }
+
+# -----------------------------------------------------------------------------
+
+sub finished { return $_[0]->{master_closed} ; }
+
+# -----------------------------------------------------------------------------
+
+sub spawn
+{
+my ($self) = @_ ;
+
+die "child already spawned\n" if defined $self->{pid} ;
+
+require IO::Pty ;
+
+my $master = IO::Pty->new() or die "cannot create a pty: $!\n" ;
+
+copy_window_size($master, $self->{input}) ;
+
+pipe(my $error_read, my $error_write) or die "pipe: $!\n" ;
+
+my $pid = fork() ;
+
+die "fork: $!\n" unless defined $pid ;
+
+child_exec($master, $error_read, $error_write, @{$self->{command}}) if $pid == 0 ;
+
+$master->close_slave() ;
+
+close $error_write ;
+
+my $error = '' ;
+
+while (1)
+	{
+	my $count = sysread($error_read, my $chunk, 4096) ;
+	
+	if (!defined $count)
+		{
+		next if $!{EINTR} ;
+		
+		last ;
+		}
+	
+	last if $count == 0 ;
+	
+	$error .= $chunk ;
+	}
+
+close $error_read ;
+
+if (length $error)
+	{
+	waitpid($pid, 0) ;
+	
+	close $master ;
+	
+	die "cannot execute '$self->{command}[0]': $error\n" ;
+	}
+
+$master->blocking(0) ;
+
+$self->{pid}        = $pid ;
+$self->{master}     = $master ;
+$self->{spawned_at} = monotonic() ;
+
+return $pid ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub child_exec
+{
+my ($master, $error_read, $error_write, @command) = @_ ;
+
+my $report = sub { syswrite($error_write, $_[0]) ; POSIX::_exit(127) ; } ;
+
+close $error_read ;
+
+$SIG{$_} = 'DEFAULT' for qw(INT QUIT TERM HUP PIPE CHLD WINCH TSTP TTIN TTOU CONT USR1 USR2 ALRM) ;
+
+POSIX::setsid() or $report->("setsid: $!") ;
+
+my $slave = $master->slave() or $report->("cannot open the pty slave: $!") ;
+
+$master->make_slave_controlling_terminal() ;
+
+close $master ;
+
+open(STDIN, '<&', $slave) or $report->("cannot use the pty as stdin: $!") ;
+open(STDOUT, '>&', $slave) or $report->("cannot use the pty as stdout: $!") ;
+open(STDERR, '>&', $slave) or $report->("cannot use the pty as stderr: $!") ;
+
+close $slave ;
+
+{
+no warnings 'exec' ;
+
+exec { $command[0] } @command ;
+}
+
+$report->("$!") ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub reap
+{
+my ($self, $flags) = @_ ;
+
+return 1 if defined $self->{exit_code} ;
+
+die "child not spawned\n" unless defined $self->{pid} ;
+
+my $result ;
+
+while (1)
+	{
+	$result = waitpid($self->{pid}, $flags) ;
+	
+	last unless $result < 0 && $!{EINTR} ;
+	}
+
+return 0 if $result == 0 ;
+
+my $status = $result < 0 ? 255 << 8 : $?  ;
+
+$self->{exit_code} = $status & 127 ? 128 + ($status & 127) : $status >> 8 ;
+
+return 1 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub wait_exit
+{
+my ($self) = @_ ;
+
+$self->reap(0) ;
+
+return $self->{exit_code} ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub is_running
+{
+my ($self) = @_ ;
+
+return 0 unless defined $self->{pid} ;
+
+return $self->reap(POSIX::WNOHANG()) ? 0 : 1 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub signal
+{
+my ($self, $name) = @_ ;
+
+die "child not spawned\n" unless defined $self->{pid} ;
+
+return kill $name, -$self->{pid} ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub close_master
+{
+my ($self) = @_ ;
+
+close $self->{master} if defined $self->{master} && defined fileno($self->{master}) ;
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub enter_raw_mode
+{
+my ($fh) = @_ ;
+
+return unless defined fileno($fh) && -t $fh ;
+
+my $saved = POSIX::Termios->new() ;
+
+$saved->getattr(fileno $fh) or return ;
+
+my $raw = POSIX::Termios->new() ;
+
+$raw->getattr(fileno $fh) or return ;
+
+$raw->setiflag($raw->getiflag() & ~(POSIX::IGNBRK() | POSIX::BRKINT() | POSIX::PARMRK() | POSIX::ISTRIP() | POSIX::INLCR() | POSIX::IGNCR() | POSIX::ICRNL() | POSIX::IXON())) ;
+$raw->setoflag($raw->getoflag() & ~POSIX::OPOST()) ;
+$raw->setlflag($raw->getlflag() & ~(POSIX::ECHO() | POSIX::ECHONL() | POSIX::ICANON() | POSIX::ISIG() | POSIX::IEXTEN())) ;
+$raw->setcflag(($raw->getcflag() & ~(POSIX::CSIZE() | POSIX::PARENB())) | POSIX::CS8()) ;
+$raw->setcc(POSIX::VMIN(), 1) ;
+$raw->setcc(POSIX::VTIME(), 0) ;
+
+$raw->setattr(fileno $fh, POSIX::TCSANOW()) or return ;
+
+my %state = (fh => $fh, termios => $saved, pid => $$, active => 1) ;
+
+push @RAW_MODES, \%state ;
+
+return \%state ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub leave_raw_mode
+{
+my ($state) = @_ ;
+
+return unless $state ;
+
+@RAW_MODES = grep { $_ != $state } @RAW_MODES ;
+
+$state->{active} = 0 ;
+
+return unless defined fileno($state->{fh}) ;
+
+$state->{termios}->setattr(fileno $state->{fh}, POSIX::TCSANOW()) ;
+
+return 1 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub restore_all
+{
+leave_raw_mode($_) for grep { $_->{pid} == $$ } @RAW_MODES ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub raw_mode
+{
+my ($self) = @_ ;
+
+return 1 if $self->{raw} && $self->{raw}{active} ;
+
+$self->{raw} = enter_raw_mode($self->{input}) ;
+
+return $self->{raw} ? 1 : 0 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub restore_mode
+{
+my ($self) = @_ ;
+
+leave_raw_mode(delete $self->{raw}) ;
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub rules { return $_[0]->{chain}->rules() ; }
+
+# -----------------------------------------------------------------------------
+
+sub filter_keys
+{
+my ($self, $data) = @_ ;
+
+my $rules = $self->rules() ;
+
+return $data if !length $self->{key_buffer} && !$rules->count() ;
+
+$self->{key_buffer} .= $data ;
+
+my ($keys, $rest) = KeyFilter::Key::split_keys($self->{key_buffer}) ;
+
+$self->{key_buffer}   = $rest ;
+$self->{key_deadline} = length $rest ? monotonic() + $self->{key_timeout} : undef ;
+
+return $rules->process_keys(@$keys) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub key_remaining
+{
+my ($self) = @_ ;
+
+return undef unless defined $self->{key_deadline} ;
+
+my $remaining = $self->{key_deadline} - monotonic() ;
+
+return $remaining < 0 ? 0 : $remaining ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub flush_key_buffer
+{
+my ($self) = @_ ;
+
+return 0 unless length $self->{key_buffer} ;
+
+my @keys = KeyFilter::Key::flush_keys($self->{key_buffer}) ;
+
+$self->{key_buffer}   = '' ;
+$self->{key_deadline} = undef ;
+
+$self->send_input($self->rules()->process_keys(@keys)) ;
+
+return 1 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub flush_keys_if_due
+{
+my ($self) = @_ ;
+
+my $remaining = $self->key_remaining() ;
+
+return 0 unless defined $remaining && $remaining <= 0 ;
+
+return $self->flush_key_buffer() ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub command_errors { return @{$_[0]->{command_errors}} ; }
+
+# -----------------------------------------------------------------------------
+
+sub apply_command
+{
+my ($self, $command) = @_ ;
+
+my $name   = ref($command) eq 'HASH' ? ($command->{cmd} // '') : '' ;
+my $method = $APPLY_METHOD{$name} ;
+
+if (!$method)
+	{
+	push @{$self->{command_errors}}, "the command '$name' is not supported" ;
+	
+	return 0 ;
+	}
+
+if (!$self->{chain} && $NEEDS_CHAIN{$name})
+	{
+	push @{$self->{command_errors}}, "the command '$name' needs a chain of profiles" ;
+	
+	return 0 ;
+	}
+
+my $applied = eval { $self->$method($command) ; 1 } ;
+
+if (!$applied)
+	{
+	(my $message = $@) =~ s/\n\z// ;
+	
+	push @{$self->{command_errors}}, $message ;
+	
+	return 0 ;
+	}
+
+return 1 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub apply_toggle
+{
+my ($self, $command) = @_ ;
+
+$self->{chain}->toggle($command->{profile}) ;
+
+return ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub apply_send
+{
+my ($self, $command) = @_ ;
+
+$self->send_input($command->{text}) ;
+
+return ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub apply_rule
+{
+my ($self, $command) = @_ ;
+
+$self->{chain}->add_runtime($command) ;
+
+return ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub service_control
+{
+my ($self, $fh) = @_ ;
+
+my $applied = 0 ;
+
+for my $command ($self->{control}->service($fh))
+	{
+	$self->apply_command($command) ;
+	
+	$applied++ ;
+	}
+
+return $applied ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub filter_input
+{
+my ($self, $data) = @_ ;
+
+return $self->filter_keys($data) if $self->{chain} ;
+
+return $data unless $self->{filter} ;
+
+my $filtered = $self->{filter}->($data) ;
+
+return defined $filtered ? $filtered : '' ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub send_input
+{
+my ($self, $data) = @_ ;
+
+if (length $data)
+	{
+	$self->{pending_input} .= $data ;
+	$self->{last_sent}      = substr($data, -1) ;
+	
+	$self->{recorder}->record_input($data) if $self->{recorder} ;
+	}
+
+return $self->flush_input() ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub flush_input
+{
+my ($self) = @_ ;
+
+my $master = $self->{master} ;
+
+return $self->pending_input() unless defined $master && defined fileno($master) ;
+
+while (length $self->{pending_input})
+	{
+	my $written = syswrite($master, $self->{pending_input}) ;
+	
+	if (!defined $written)
+		{
+		last if $!{EAGAIN} || $!{EINTR} ;
+		
+		$self->{pending_input} = '' ;
+		
+		last ;
+		}
+	
+	substr($self->{pending_input}, 0, $written, '') ;
+	}
+
+return $self->pending_input() ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub send_eof
+{
+my ($self) = @_ ;
+
+my $eof       = "\x04" ;
+my $canonical = 0 ;
+my $master    = $self->{master} ;
+
+if (defined $master && defined fileno($master))
+	{
+	my $termios = POSIX::Termios->new() ;
+	
+	if ($termios->getattr(fileno $master))
+		{
+		my $char = $termios->getcc(POSIX::VEOF()) ;
+		
+		$eof       = chr $char if $char ;
+		$canonical = $termios->getlflag() & POSIX::ICANON() ;
+		}
+	}
+
+my $partial = $canonical && length $self->{last_sent} && $self->{last_sent} ne "\n" ;
+
+return $self->send_input($partial ? $eof x 2 : $eof) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub forward_input
+{
+my ($self) = @_ ;
+
+return 0 if $self->{input_eof} ;
+
+my $count = sysread($self->{input}, my $data, 8192) ;
+
+if (!defined $count)
+	{
+	return undef if $!{EAGAIN} || $!{EINTR} ;
+	
+	die "cannot read the input: $!\n" ;
+	}
+
+if ($count == 0)
+	{
+	$self->{input_eof} = 1 ;
+	
+	$self->flush_key_buffer() ;
+	$self->send_eof() ;
+	
+	return 0 ;
+	}
+
+$self->send_input($self->filter_input($data)) ;
+
+return $count ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub pump
+{
+my ($self, $timeout) = @_ ;
+
+my $deadline = defined $timeout ? Time::HiRes::time() + $timeout : undef ;
+
+while (1)
+	{
+	my @read = ($self->{wake_read}) ;
+	
+	push @read, $self->{input} unless $self->{input_eof} ;
+	push @read, $self->{master} if defined $self->{master} && !$self->{master_closed} ;
+	
+	my @control = $self->{control} ? $self->{control}->handles() : () ;
+	
+	push @read, @control ;
+	
+	my @write = ($self->pending_input() && defined $self->{master}) ? ($self->{master}) : () ;
+	
+	my $remaining = defined $deadline ? $deadline - Time::HiRes::time() : undef ;
+	
+	$remaining = 0 if defined $remaining && $remaining < 0 ;
+	
+	my $due = $self->next_timer() ;
+	
+	$remaining = $due if defined $due && (!defined $remaining || $due < $remaining) ;
+	
+	$! = 0 ;
+	
+	my ($readable, $writable) = IO::Select->select(IO::Select->new(@read), IO::Select->new(@write), undef, $remaining) ;
+	
+	next if !$readable && $!{EINTR} ;
+	
+	my $events = 0 ;
+	
+	for my $fh (@{$readable // []})
+		{
+		if ($fh == $self->{wake_read})
+			{
+			$events += $self->dispatch_events() ;
+			}
+		elsif (defined $self->{master} && $fh == $self->{master})
+			{
+			$self->forward_output() ;
+			
+			$events++ ;
+			}
+		elsif (grep { $fh == $_ } @control)
+			{
+			$events += $self->service_control($fh) || 1 ;
+			}
+		else
+			{
+			$self->forward_input() ;
+			
+			$events++ ;
+			}
+		}
+	
+	for my $fh (@{$writable // []})
+		{
+		$self->flush_input() ;
+		
+		$events++ ;
+		}
+	
+	$events += $self->fire_startup() ;
+	$events += $self->flush_keys_if_due() ;
+	
+	return $events if $events ;
+	
+	my $waiting = $self->next_timer() ;
+	
+	next if defined $waiting && $waiting > 0 && (!defined $deadline || Time::HiRes::time() < $deadline) ;
+	
+	return 0 ;
+	}
+}
+
+# -----------------------------------------------------------------------------
+
+sub forward_output
+{
+my ($self) = @_ ;
+
+my $count = sysread($self->{master}, my $data, 8192) ;
+
+if (!defined $count)
+	{
+	return undef if $!{EAGAIN} || $!{EINTR} ;
+	
+	$self->{master_closed} = 1 ;
+	
+	return 0 ;
+	}
+
+if ($count == 0)
+	{
+	$self->{master_closed} = 1 ;
+	
+	return 0 ;
+	}
+
+$self->write_output($data) ;
+
+return $count ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub write_output
+{
+my ($self, $data) = @_ ;
+
+$self->{on_output}->($data) if $self->{on_output} ;
+$self->{recorder}->record_output($data) if $self->{recorder} ;
+
+return if $self->{output_broken} ;
+
+local $SIG{PIPE} = 'IGNORE' ;
+
+my $fh = $self->{output} ;
+
+while (length $data)
+	{
+	my $written = syswrite($fh, $data) ;
+	
+	if (!defined $written)
+		{
+		next if $!{EINTR} ;
+		
+		if ($!{EAGAIN})
+			{
+			IO::Select->new($fh)->can_write(1) ;
+			
+			next ;
+			}
+		
+		$self->{output_broken} = 1 ;
+		
+		return ;
+		}
+	
+	substr($data, 0, $written, '') ;
+	}
+}
+
+# -----------------------------------------------------------------------------
+
+sub run
+{
+my ($self) = @_ ;
+
+die "the command has already been run\n" if $self->{ran} ;
+
+$self->{ran} = 1 ;
+
+$self->spawn() ;
+
+local $SIG{PIPE} = 'IGNORE' ;
+
+$self->handle_signal(CHLD => 'C') ;
+$self->handle_signal(WINCH => 'W') ;
+$self->forward_signal($_) for qw(INT TERM QUIT HUP) ;
+$self->wake('C') ;
+
+$self->raw_mode() ;
+
+my $ok    = eval { $self->pump(1) until $self->finished() ; 1 } ;
+my $error = $@ ;
+
+$self->restore_mode() ;
+
+if (!$ok)
+	{
+	$self->close_master() ;
+	$self->cleanup() ;
+	
+	die $error ;
+	}
+
+my $code = $self->wait_exit() ;
+
+$self->{recorder}->record_exit($code) if $self->{recorder} ;
+
+$self->close_master() ;
+$self->cleanup() ;
+
+return $code ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub wake
+{
+my ($self, $char) = @_ ;
+
+return unless defined $self->{wake_write} && defined fileno($self->{wake_write}) ;
+
+syswrite($self->{wake_write}, $char) ;
+
+return ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub drain_events
+{
+my ($self) = @_ ;
+
+return '' unless defined $self->{wake_read} && defined fileno($self->{wake_read}) ;
+
+my $events = '' ;
+
+while (1)
+	{
+	my $count = sysread($self->{wake_read}, my $chunk, 4096) ;
+	
+	last unless defined $count && $count > 0 ;
+	
+	$events .= $chunk ;
+	}
+
+return $events ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub dispatch_events
+{
+my ($self) = @_ ;
+
+my @events = split //, $self->drain_events() ;
+
+for my $event (@events)
+	{
+	$self->{on_event}->($event) if $self->{on_event} ;
+	
+	my $method = $EVENT_METHOD{$event} ;
+	
+	$self->$method() if $method ;
+	}
+
+return scalar @events ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub handle_signal
+{
+my ($self, $name, $char) = @_ ;
+
+my $weak = $self ;
+
+Scalar::Util::weaken($weak) ;
+
+$self->{signals}{$name} = { previous => $SIG{$name} } unless exists $self->{signals}{$name} ;
+
+$SIG{$name} = sub { $weak->wake($char) if $weak ; } ;
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub restore_signals
+{
+my ($self) = @_ ;
+
+for my $name (keys %{$self->{signals}})
+	{
+	my $previous = delete $self->{signals}{$name} ;
+	
+	$SIG{$name} = defined $previous->{previous} ? $previous->{previous} : 'DEFAULT' ;
+	}
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub cleanup
+{
+my ($self) = @_ ;
+
+$self->restore_signals() ;
+
+$self->{recorder}->close() if $self->{recorder} ;
+$self->{control}->close() if $self->{control} ;
+
+for my $name ('wake_read', 'wake_write')
+	{
+	close $self->{$name} if defined $self->{$name} && defined fileno($self->{$name}) ;
+	}
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub child_exited
+{
+my ($self) = @_ ;
+
+return 0 unless defined $self->{pid} && $self->reap(POSIX::WNOHANG()) ;
+
+$self->drain_output() ;
+
+$self->{master_closed} = 1 ;
+
+return 1 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub drain_output
+{
+my ($self) = @_ ;
+
+return unless defined $self->{master} && defined fileno($self->{master}) ;
+
+for (1 .. 256)
+	{
+	my $count = $self->forward_output() ;
+	
+	last unless $count ;
+	}
+
+return ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub forward_signal
+{
+my ($self, $name) = @_ ;
+
+my $weak = $self ;
+
+Scalar::Util::weaken($weak) ;
+
+$self->{signals}{$name} = { previous => $SIG{$name} } unless exists $self->{signals}{$name} ;
+
+$SIG{$name} = sub { $weak->signal($name) if $weak && defined $weak->{pid} && !defined $weak->{exit_code} ; } ;
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub copy_window_size
+{
+my ($master, $input) = @_ ;
+
+return 0 unless defined $master && defined $input && defined fileno($input) && -t $input ;
+
+return eval { $master->clone_winsize_from($input) ; 1 } ? 1 : 0 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub sync_window_size
+{
+my ($self) = @_ ;
+
+return copy_window_size($self->{master}, $self->{input}) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub window_changed
+{
+my ($self) = @_ ;
+
+return $self->sync_window_size() ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub monotonic { return Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) ; }
+
+# -----------------------------------------------------------------------------
+
+sub next_timer
+{
+my ($self) = @_ ;
+
+my @remaining = grep { defined } ($self->startup_remaining(), $self->key_remaining()) ;
+
+return undef unless @remaining ;
+
+my ($least) = sort { $a <=> $b } @remaining ;
+
+return $least ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub startup_fired { return $_[0]->{startup_fired} ; }
+
+# -----------------------------------------------------------------------------
+
+sub startup_remaining
+{
+my ($self) = @_ ;
+
+return undef unless defined $self->{startup} && !$self->{startup_fired} && defined $self->{spawned_at} ;
+
+my $remaining = $self->{spawned_at} + $self->{startup}->delay_ms() / 1000 - monotonic() ;
+
+return $remaining < 0 ? 0 : $remaining ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub fire_startup
+{
+my ($self) = @_ ;
+
+my $remaining = $self->startup_remaining() ;
+
+return 0 unless defined $remaining && $remaining <= 0 ;
+
+$self->{startup_fired} = 1 ;
+
+$self->send_input($_) for $self->{startup}->actions() ;
+
+$self->{on_startup}->($self->{startup}) if $self->{on_startup} ;
+
+return 1 ;
+}
+
+# -----------------------------------------------------------------------------
+
+package KeyFilter::Discovery ;
+
+use IO::Handle () ;
+use IO::Select () ;
+
+our $VERSION = '0.01' ;
+
+# -----------------------------------------------------------------------------
+
+sub hex_of
+{
+my ($bytes) = @_ ;
+
+return join(' ', map { sprintf('%02x', ord) } split(//, $bytes)) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub describe
+{
+my ($sequence, $eol) = @_ ;
+
+$eol //= "\n" ;
+
+my $name = KeyFilter::Key::name_of($sequence) // '(unknown)' ;
+
+return "Key      : $name$eol" . 'Sequence : ' . hex_of($sequence) . "$eol$eol" ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub run
+{
+my (%arguments) = @_ ;
+
+my $input   = $arguments{input} // \*STDIN ;
+my $output  = $arguments{output} // \*STDOUT ;
+my $error   = $arguments{error} // \*STDERR ;
+my $timeout = $arguments{timeout} // 0.05 ;
+
+my $raw = KeyFilter::PTY::enter_raw_mode($input) ;
+my $eol = $raw ? "\r\n" : "\n" ;
+
+$output->autoflush(1) ;
+$error->autoflush(1) ;
+
+print $error "Press keys to see what they send, Ctrl-C twice to stop.$eol" if $raw ;
+
+my $select     = IO::Select->new($input) ;
+my $buffer     = '' ;
+my $interrupts = 0 ;
+my $stop       = 0 ;
+
+my $report = sub
+	{
+	for my $key (@_)
+		{
+		print $output describe($key, $eol) ;
+		
+		$interrupts = $key eq "\x03" ? $interrupts + 1 : 0 ;
+		
+		$stop = 1 if $interrupts >= 2 ;
+		
+		last if $stop ;
+		}
+	} ;
+
+until ($stop)
+	{
+	my @ready = $select->can_read(length $buffer ? $timeout : undef) ;
+	
+	if (!@ready)
+		{
+		next unless length $buffer ;
+		
+		$report->(KeyFilter::Key::flush_keys($buffer)) ;
+		
+		$buffer = '' ;
+		
+		next ;
+		}
+	
+	my $count = sysread($input, my $data, 4096) ;
+	
+	next if !defined $count && $!{EINTR} ;
+	
+	last if !defined $count ;
+	
+	if ($count == 0)
+		{
+		my ($keys, $rest) = KeyFilter::Key::split_keys($buffer) ;
+		
+		$report->(@$keys, KeyFilter::Key::flush_keys($rest)) ;
+		
+		last ;
+		}
+	
+	$buffer .= $data ;
+	
+	my ($keys, $rest) = KeyFilter::Key::split_keys($buffer) ;
+	
+	$buffer = $rest ;
+	
+	$report->(@$keys) ;
+	}
+
+KeyFilter::PTY::leave_raw_mode($raw) ;
+
+return 0 ;
+}
+
+# -----------------------------------------------------------------------------
+
+package KeyFilter::Startup ;
+
+use Scalar::Util () ;
+
+our $VERSION = '0.01' ;
+
+my %STARTUP_NAME =
+	(
+	'startup-delay' => 1,
+	'send-startup'  => 1,
+	) ;
+
+# -----------------------------------------------------------------------------
+
+sub new
+{
+my ($class, @commands) = @_ ;
+
+my $delay = 0 ;
+my @actions ;
+
+for my $command (@commands)
+	{
+	my $name = ref($command) eq 'HASH' ? ($command->{cmd} // '') : '' ;
+	
+	die "not a startup command '$name'\n" unless $STARTUP_NAME{$name} ;
+	
+	$delay = $command->{ms} if $name eq 'startup-delay' ;
+	
+	push @actions, $command->{text} if $name eq 'send-startup' ;
+	}
+
+return bless { delay_ms => $delay, actions => \@actions }, $class ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub from_profiles
+{
+my ($class, @profiles) = @_ ;
+
+for my $profile (@profiles)
+	{
+	die "not a profile\n" unless Scalar::Util::blessed($profile) && $profile->can('startup') ;
+	}
+
+return $class->new(KeyFilter::Profile::build_startup(@profiles)) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub delay_ms { return $_[0]->{delay_ms} ; }
+
+#--#
+
+sub actions { return @{$_[0]->{actions}} ; }
+
+#--#
+
+sub text { return join('', $_[0]->actions()) ; }
+
+# -----------------------------------------------------------------------------
+
+package KeyFilter::Recorder ;
+
+use IO::Handle () ;
+use Time::HiRes () ;
+
+our $VERSION = '0.01' ;
+
+my %ENCODE_ESCAPE =
+	(
+	"\\" => '\\\\',
+	"\n" => '\n',
+	"\r" => '\r',
+	"\t" => '\t',
+	"\e" => '\e',
+	) ;
+
+my %DECODE_ESCAPE =
+	(
+	'\\' => "\\",
+	'n'  => "\n",
+	'r'  => "\r",
+	't'  => "\t",
+	'e'  => "\e",
+	) ;
+
+# -----------------------------------------------------------------------------
+
+sub monotonic_seconds { return Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) ; }
+
+# -----------------------------------------------------------------------------
+
+sub encode
+{
+my ($bytes) = @_ ;
+
+my $text = '' ;
+
+for my $char (split //, $bytes)
+	{
+	my $code = ord $char ;
+	
+	if (exists $ENCODE_ESCAPE{$char})
+		{
+		$text .= $ENCODE_ESCAPE{$char} ;
+		}
+	elsif ($code >= 0x20 && $code <= 0x7e)
+		{
+		$text .= $char ;
+		}
+	else
+		{
+		$text .= sprintf('\x%02x', $code) ;
+		}
+	}
+
+return $text ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub decode_escape
+{
+my ($hex, $char) = @_ ;
+
+return chr hex $hex if defined $hex ;
+
+die "trailing backslash in a recording\n" unless defined $char ;
+
+die "unknown escape '\\$char' in a recording\n" unless exists $DECODE_ESCAPE{$char} ;
+
+return $DECODE_ESCAPE{$char} ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub decode
+{
+my ($text) = @_ ;
+
+$text =~ s{\\(?:x([0-9a-fA-F]{2})|(.)|\z)}{decode_escape($1, $2)}gse ;
+
+return $text ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub new
+{
+my ($class, %arguments) = @_ ;
+
+my ($handle, $owned) ;
+
+if (defined $arguments{file})
+	{
+	open($handle, '>', $arguments{file}) or die "cannot write the recording '$arguments{file}': $!\n" ;
+	
+	$owned = 1 ;
+	}
+elsif (defined $arguments{handle})
+	{
+	$handle = $arguments{handle} ;
+	}
+else
+	{
+	die "a recording needs a file or a handle\n" ;
+	}
+
+binmode $handle ;
+
+$handle->autoflush(1) ;
+
+my $clock = $arguments{clock} // \&monotonic_seconds ;
+
+my %self = (handle => $handle, owned => $owned, closed => 0, exited => 0, clock => $clock, start => $clock->(), last => 0) ;
+
+my $self = bless \%self, $class ;
+
+$self->write_line('# keyfilter-recording 1') ;
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub write_line
+{
+my ($self, $line) = @_ ;
+
+return if $self->{closed} ;
+
+print { $self->{handle} } "$line\n" ;
+
+return ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub elapsed
+{
+my ($self) = @_ ;
+
+my $elapsed = $self->{clock}->() - $self->{start} ;
+
+$elapsed = $self->{last} if $elapsed < $self->{last} ;
+
+$self->{last} = $elapsed ;
+
+return sprintf('%.6f', $elapsed) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub record
+{
+my ($self, $type, $bytes) = @_ ;
+
+return unless defined $bytes && length $bytes ;
+
+return if $self->{exited} ;
+
+$self->write_line($self->elapsed() . " $type " . encode($bytes)) ;
+
+return ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub record_exit
+{
+my ($self, $code) = @_ ;
+
+die "invalid exit code '" . ($code // '') . "'\n" unless defined $code && $code =~ /\A\d+\z/ && $code <= 255 ;
+
+return if $self->{exited} || $self->{closed} ;
+
+$self->{exited} = 1 ;
+
+$self->write_line($self->elapsed() . " X $code") ;
+
+return ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub record_input { my ($self, $bytes) = @_ ; return $self->record('I', $bytes) ; }
+
+# -----------------------------------------------------------------------------
+
+sub record_output { my ($self, $bytes) = @_ ; return $self->record('O', $bytes) ; }
+
+# -----------------------------------------------------------------------------
+
+sub close
+{
+my ($self) = @_ ;
+
+return $self if $self->{closed} ;
+
+$self->{closed} = 1 ;
+
+if ($self->{owned})
+	{
+	CORE::close($self->{handle}) ;
+	}
+else
+	{
+	$self->{handle}->flush() ;
+	}
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub parse_recording
+{
+my ($text) = @_ ;
+
+my @events ;
+my $number = 0 ;
+my $last   = 0 ;
+my $exited = 0 ;
+
+for my $line (split /\n/, $text)
+	{
+	$number++ ;
+	
+	next if $line =~ /\A#/ || $line =~ /\A\s*\z/ ;
+	
+	die "recording line $number: invalid event\n" unless $line =~ /\A(\d+\.\d{6}) ([IOX]) ?(.*)\z/ ;
+	
+	my ($time, $type, $payload) = ($1, $2, $3) ;
+	
+	die "recording line $number: the time goes back\n" if $time < $last ;
+	die "recording line $number: an event after the exit code\n" if $exited ;
+	
+	$last = $time ;
+	
+	if ($type eq 'X')
+		{
+		die "recording line $number: invalid exit code\n" unless $payload =~ /\A\d+\z/ && $payload <= 255 ;
+		
+		$exited = 1 ;
+		
+		push @events, { time => $time + 0, type => 'X', code => $payload + 0 } ;
+		
+		next ;
+		}
+	
+	my $data = eval { decode($payload) ; } ;
+	
+	die "recording line $number: $@" if $@ ;
+	
+	push @events, { time => $time + 0, type => $type, data => $data } ;
+	}
+
+return @events ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub exit_code_of
+{
+my (@events) = @_ ;
+
+my ($exit) = grep { $_->{type} eq 'X' } @events ;
+
+return $exit ? $exit->{code} : undef ;
+}
+
+# -----------------------------------------------------------------------------
+
+package KeyFilter::Replayer ;
+
+use Time::HiRes () ;
+
+our $VERSION = '0.01' ;
+
+# -----------------------------------------------------------------------------
+
+sub new
+{
+my ($class, %arguments) = @_ ;
+
+my $text ;
+
+if (defined $arguments{file})
+	{
+	open(my $fh, '<', $arguments{file}) or die "cannot read the recording '$arguments{file}': $!\n" ;
+	
+	binmode $fh ;
+	
+	local $/ ;
+	
+	$text = <$fh> // '' ;
+	
+	close $fh ;
+	}
+elsif (defined $arguments{text})
+	{
+	$text = $arguments{text} ;
+	}
+else
+	{
+	die "a replay needs a recording\n" ;
+	}
+
+my @events = eval { KeyFilter::Recorder::parse_recording($text) ; } ;
+
+die defined $arguments{file} ? "$arguments{file}: $@" : $@ if $@ ;
+
+my %self =
+	(
+	events => \@events,
+	output => $arguments{output} // \*STDOUT,
+	fast   => $arguments{fast} ? 1 : 0,
+	clock  => $arguments{clock} // \&KeyFilter::Recorder::monotonic_seconds,
+	sleep  => $arguments{sleep} // sub { Time::HiRes::sleep($_[0]) ; },
+	broken => 0,
+	) ;
+
+return bless \%self, $class ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub events { return @{$_[0]->{events}} ; }
+
+# -----------------------------------------------------------------------------
+
+sub exit_code { return KeyFilter::Recorder::exit_code_of($_[0]->events()) // 0 ; }
+
+# -----------------------------------------------------------------------------
+
+sub wait_until
+{
+my ($self, $time, $start) = @_ ;
+
+while (1)
+	{
+	my $remaining = $time - ($self->{clock}->() - $start) ;
+	
+	last unless $remaining > 0 ;
+	
+	$self->{sleep}->($remaining) ;
+	}
+
+return ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub write_output
+{
+my ($self, $data) = @_ ;
+
+my $fh = $self->{output} ;
+
+while (length $data)
+	{
+	my $written = syswrite($fh, $data) ;
+	
+	if (!defined $written)
+		{
+		next if $!{EINTR} ;
+		
+		if ($!{EAGAIN})
+			{
+			IO::Select->new($fh)->can_write(1) ;
+			
+			next ;
+			}
+		
+		$self->{broken} = 1 ;
+		
+		return ;
+		}
+	
+	substr($data, 0, $written, '') ;
+	}
+
+return ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub run
+{
+my ($self) = @_ ;
+
+local $SIG{PIPE} = 'IGNORE' ;
+
+my $start = $self->{clock}->() ;
+
+for my $event ($self->events())
+	{
+	$self->wait_until($event->{time}, $start) unless $self->{fast} ;
+	
+	$self->write_output($event->{data}) if $event->{type} eq 'O' ;
+	
+	last if $self->{broken} ;
+	}
+
+return $self->exit_code() ;
+}
+
+# -----------------------------------------------------------------------------
+
+package KeyFilter::Control ;
+
+use File::Path () ;
+use IO::Socket::UNIX () ;
+use Socket () ;
+
+our $VERSION = '0.01' ;
+
+my $MAXIMUM_PATH = 100 ;
+my $MAXIMUM_LINE = 65536 ;
+
+my %RUNTIME_COMMAND =
+	(
+	block   => 1,
+	unblock => 1,
+	map     => 1,
+	toggle  => 1,
+	send    => 1,
+	) ;
+
+# -----------------------------------------------------------------------------
+
+sub socket_dir
+{
+my $home = $ENV{HOME} // die "HOME is not set\n" ;
+
+return "$home/.config/keyfilter/sockets" ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub new
+{
+my ($class, %arguments) = @_ ;
+
+my $dir  = $arguments{dir} // socket_dir() ;
+my $pid  = $arguments{pid} // $$ ;
+my $path = "$dir/$pid.sock" ;
+
+die "the socket path '$path' is too long\n" if length $path > $MAXIMUM_PATH ;
+
+if (!-d $dir)
+	{
+	File::Path::make_path($dir, { mode => 0700, error => \my $errors }) ;
+	
+	if ($errors && @$errors)
+		{
+		my ($file, $message) = %{$errors->[0]} ;
+		
+		die "cannot create the socket directory '$dir': $message\n" ;
+		}
+	}
+
+unlink $path if -e $path || -l $path ;
+
+my $listener = IO::Socket::UNIX->new(Local => $path, Listen => 16, Type => Socket::SOCK_STREAM()) or die "cannot create the socket '$path': $!\n" ;
+
+chmod 0600, $path ;
+
+$listener->blocking(0) ;
+
+my %self =
+	(
+	dir       => $dir,
+	pid       => $pid,
+	path      => $path,
+	info_path => "$dir/$pid.info",
+	listener  => $listener,
+	closed    => 0,
+	clients   => {},
+	errors    => [],
+	) ;
+
+my $self = bless \%self, $class ;
+
+$self->write_info($arguments{info}) if $arguments{info} ;
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub write_info
+{
+my ($self, $info) = @_ ;
+
+my $text = '' ;
+
+for my $key (sort keys %$info)
+	{
+	my $value = $info->{$key} // '' ;
+	
+	$value =~ s/[\x00-\x1f\x7f]+/ /g ;
+	
+	$text .= "$key: $value\n" ;
+	}
+
+open(my $fh, '>', $self->{info_path}) or die "cannot write '$self->{info_path}': $!\n" ;
+
+print $fh $text ;
+
+CORE::close($fh) or die "cannot write '$self->{info_path}': $!\n" ;
+
+chmod 0600, $self->{info_path} ;
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub info_path { return $_[0]->{info_path} ; }
+
+# -----------------------------------------------------------------------------
+
+sub dir { return $_[0]->{dir} ; }
+
+# -----------------------------------------------------------------------------
+
+sub pid { return $_[0]->{pid} ; }
+
+# -----------------------------------------------------------------------------
+
+sub path { return $_[0]->{path} ; }
+
+# -----------------------------------------------------------------------------
+
+sub listener { return $_[0]->{listener} ; }
+
+# -----------------------------------------------------------------------------
+
+sub accept
+{
+my ($self) = @_ ;
+
+return undef if $self->{closed} ;
+
+return $self->{listener}->accept() ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub parse_line
+{
+my ($line) = @_ ;
+
+my $command = KeyFilter::Command::parse_command($line) ;
+
+return undef unless $command ;
+
+die "the command '$command->{cmd}' is not allowed at runtime\n" unless $RUNTIME_COMMAND{$command->{cmd}} ;
+
+return $command ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub errors { return map { { %$_ } } @{$_[0]->{errors}} ; }
+
+# -----------------------------------------------------------------------------
+
+sub clear_errors
+{
+my ($self) = @_ ;
+
+$self->{errors} = [] ;
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub client_count { return scalar keys %{$_[0]->{clients}} ; }
+
+# -----------------------------------------------------------------------------
+
+sub handles
+{
+my ($self) = @_ ;
+
+return () if $self->{closed} ;
+
+return ($self->{listener}, map { $self->{clients}{$_}{fh} } sort { $a <=> $b } keys %{$self->{clients}}) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub accept_clients
+{
+my ($self) = @_ ;
+
+while (my $fh = $self->accept())
+	{
+	$fh->blocking(0) ;
+	
+	$self->{clients}{fileno $fh} = { fh => $fh, buffer => '' } ;
+	}
+
+return ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub drop_client
+{
+my ($self, $number) = @_ ;
+
+my $client = delete $self->{clients}{$number} ;
+
+CORE::close($client->{fh}) if $client ;
+
+return ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub handle_line
+{
+my ($self, $line) = @_ ;
+
+my $command = eval { parse_line($line) ; } ;
+
+if ($@)
+	{
+	(my $message = $@) =~ s/\n\z// ;
+	
+	push @{$self->{errors}}, { line => $line, error => $message } ;
+	
+	return () ;
+	}
+
+return defined $command ? ($command) : () ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub service
+{
+my ($self, $fh) = @_ ;
+
+return () if $self->{closed} || !defined $fh ;
+
+if ($fh == $self->{listener})
+	{
+	$self->accept_clients() ;
+	
+	return () ;
+	}
+
+my $number = defined fileno($fh) ? fileno($fh) : undef ;
+
+return () unless defined $number && exists $self->{clients}{$number} && $self->{clients}{$number}{fh} == $fh ;
+
+my $client = $self->{clients}{$number} ;
+my $count  = sysread($fh, my $data, 4096) ;
+
+if (!defined $count)
+	{
+	return () if $!{EAGAIN} || $!{EINTR} ;
+	
+	$self->drop_client($number) ;
+	
+	return () ;
+	}
+
+my @commands ;
+
+if ($count == 0)
+	{
+	push @commands, $self->handle_line($client->{buffer}) if length $client->{buffer} ;
+	
+	$self->drop_client($number) ;
+	
+	return @commands ;
+	}
+
+$client->{buffer} .= $data ;
+
+while ($client->{buffer} =~ s/\A([^\n]*)\n//)
+	{
+	(my $line = $1) =~ s/\r\z// ;
+	
+	push @commands, $self->handle_line($line) ;
+	}
+
+if (length $client->{buffer} > $MAXIMUM_LINE)
+	{
+	push @{$self->{errors}}, { line => '', error => 'line too long' } ;
+	
+	$self->drop_client($number) ;
+	}
+
+return @commands ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub close
+{
+my ($self) = @_ ;
+
+return $self if $self->{closed} ;
+
+$self->{closed} = 1 ;
+
+CORE::close($self->{listener}) ;
+
+CORE::close($_->{fh}) for values %{$self->{clients}} ;
+
+$self->{clients} = {} ;
+
+unlink $self->{path}, $self->{info_path} ;
+
+return $self ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub pid_alive
+{
+my ($pid) = @_ ;
+
+return 0 unless defined $pid && $pid =~ /\A\d+\z/ && $pid > 0 ;
+
+return 0 unless kill(0, $pid) || $!{EPERM} ;
+
+if (open(my $fh, '<', "/proc/$pid/stat"))
+	{
+	my $stat = <$fh> // '' ;
+	
+	CORE::close($fh) ;
+	
+	return 0 if $stat =~ /\) Z / ;
+	}
+
+return 1 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub read_info
+{
+my ($path) = @_ ;
+
+return {} unless open(my $fh, '<', $path) ;
+
+my %info ;
+
+while (my $line = <$fh>)
+	{
+	$line =~ s/\r?\n\z// ;
+	
+	$info{$1} = $2 if $line =~ /\A([A-Za-z_][\w-]*):[ \t]*(.*?)[ \t]*\z/ ;
+	}
+
+CORE::close($fh) ;
+
+return \%info ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub instances
+{
+my ($dir) = @_ ;
+
+$dir //= socket_dir() ;
+
+return () unless opendir(my $handle, $dir) ;
+
+my @names = grep { /\A\d+\.sock\z/ } readdir $handle ;
+
+closedir $handle ;
+
+my @instances ;
+
+for my $name (sort { ($a =~ /(\d+)/)[0] <=> ($b =~ /(\d+)/)[0] } @names)
+	{
+	my ($pid) = $name =~ /\A(\d+)\.sock\z/ ;
+	
+	next unless -S "$dir/$name" && pid_alive($pid) ;
+	
+	push @instances, { pid => $pid + 0, socket => "$dir/$name", info => read_info("$dir/$pid.info") } ;
+	}
+
+return @instances ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub instance
+{
+my ($pid, $dir) = @_ ;
+
+return undef unless defined $pid && $pid =~ /\A\d+\z/ ;
+
+my ($found) = grep { $_->{pid} == $pid } instances($dir) ;
+
+return $found ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub remove_stale
+{
+my ($dir) = @_ ;
+
+$dir //= socket_dir() ;
+
+return () unless opendir(my $handle, $dir) ;
+
+my @names = grep { /\A\d+\.(?:sock|info)\z/ } readdir $handle ;
+
+closedir $handle ;
+
+my %stale ;
+
+for my $name (@names)
+	{
+	my ($pid) = $name =~ /\A(\d+)\./ ;
+	
+	next if pid_alive($pid) ;
+	
+	unlink "$dir/$name" ;
+	
+	$stale{$pid + 0} = 1 ;
+	}
+
+return sort { $a <=> $b } keys %stale ;
+}
+
+# -----------------------------------------------------------------------------
+
+package KeyFilter::Ctl ;
+
+use IO::Socket::UNIX () ;
+use Socket () ;
+
+our $VERSION = '0.01' ;
+
+my %COMMAND =
+	(
+	ls   => 'command_ls',
+	send => 'command_send',
+	toggle  => 'command_toggle',
+	block   => 'command_block',
+	unblock => 'command_unblock',
+	map     => 'command_map',
+	) ;
+
+my $CTL_MAXIMUM_LINE = 65536 ;
+
+# -----------------------------------------------------------------------------
+
+sub usage
+{
+return "Usage: keyfilterctl [--pid PID] command [arguments]\nTry 'keyfilterctl --help' for more information.\n" ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub help_text
+{
+return <<'HELP' ;
+Usage: keyfilterctl [--pid PID] command [arguments]
+       keyfilterctl -h | --help
+
+Control the keyfilter instances that are running for the current user.
+
+Commands:
+  ls                      list the instances, one per line: the pid and the command
+  send TEXT               send the text to the command of the instance
+  toggle PROFILE          turn a profile of the instance on or off
+  block KEYS              block keys
+  unblock KEYS            unblock keys
+  map KEY=REPLACEMENT     replace a key by text and keys
+
+Options:
+  -p, --pid PID           the instance to talk to, when there are several
+  -h, --help              show this help
+
+Instances are found by their sockets in ~/.config/keyfilter/sockets.
+See keyfilterctl(1).
+HELP
+}
+
+# -----------------------------------------------------------------------------
+
+sub choose_instance
+{
+my ($out, $err, $dir, $pid) = @_ ;
+
+if (defined $pid)
+	{
+	my $instance = KeyFilter::Control::instance($pid, $dir) ;
+	
+	return $instance if $instance ;
+	
+	print $err "keyfilterctl: no keyfilter instance has the pid $pid\n" ;
+	
+	return undef ;
+	}
+
+my @instances = KeyFilter::Control::instances($dir) ;
+
+if (!@instances)
+	{
+	print $err "keyfilterctl: no keyfilter instance is running\n" ;
+	
+	return undef ;
+	}
+
+if (@instances > 1)
+	{
+	print $err "keyfilterctl: several keyfilter instances are running (pids " . join(', ', map { $_->{pid} } @instances) . "), choose one with --pid\n" ;
+	
+	return undef ;
+	}
+
+return $instances[0] ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub deliver
+{
+my ($line, $out, $err, $dir, $pid) = @_ ;
+
+my $instance = choose_instance($out, $err, $dir, $pid) or return 2 ;
+
+local $SIG{PIPE} = 'IGNORE' ;
+
+my $socket = IO::Socket::UNIX->new(Peer => $instance->{socket}, Type => Socket::SOCK_STREAM()) ;
+
+if (!$socket)
+	{
+	print $err "keyfilterctl: cannot connect to the instance $instance->{pid}: $!\n" ;
+	
+	return 2 ;
+	}
+
+my $data = "$line\n" ;
+
+while (length $data)
+	{
+	my $written = syswrite($socket, $data) ;
+	
+	if (!defined $written)
+		{
+		next if $!{EINTR} ;
+		
+		print $err "keyfilterctl: cannot write to the instance $instance->{pid}: $!\n" ;
+		
+		return 2 ;
+		}
+	
+	substr($data, 0, $written, '') ;
+	}
+
+close $socket ;
+
+return 0 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub check_line
+{
+my ($line, $err) = @_ ;
+
+if ($line =~ /[\r\n]/)
+	{
+	print $err "keyfilterctl: the text cannot contain a line end, write \\n\n" ;
+	
+	return 0 ;
+	}
+
+if (length $line >= $CTL_MAXIMUM_LINE)
+	{
+	print $err "keyfilterctl: the command is too long\n" ;
+	
+	return 0 ;
+	}
+
+my $command = eval { KeyFilter::Control::parse_line($line) ; } ;
+
+if ($@)
+	{
+	print $err "keyfilterctl: $@" ;
+	
+	return 0 ;
+	}
+
+return $command ? 1 : 0 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub command_send
+{
+my ($arguments, $out, $err, $dir, $pid) = @_ ;
+
+my $text = join(' ', @$arguments) ;
+
+if (!length $text)
+	{
+	print $err "keyfilterctl: send requires text\n" ;
+	
+	return 1 ;
+	}
+
+my $line = "send $text" ;
+
+return 1 unless check_line($line, $err) ;
+
+return deliver($line, $out, $err, $dir, $pid) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub rule_command
+{
+my ($name, $arguments, $out, $err, $dir, $pid) = @_ ;
+
+my $text = join(' ', @$arguments) ;
+
+if ($text !~ /\S/)
+	{
+	print $err "keyfilterctl: $name requires an argument\n" ;
+	
+	return 1 ;
+	}
+
+my $line = "$name $text" ;
+
+return 1 unless check_line($line, $err) ;
+
+return deliver($line, $out, $err, $dir, $pid) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub command_block { return rule_command('block', @_) ; }
+
+# -----------------------------------------------------------------------------
+
+sub command_unblock { return rule_command('unblock', @_) ; }
+
+# -----------------------------------------------------------------------------
+
+sub command_map { return rule_command('map', @_) ; }
+
+# -----------------------------------------------------------------------------
+
+sub command_toggle
+{
+my ($arguments, $out, $err, $dir, $pid) = @_ ;
+
+if (@$arguments != 1 || !length $arguments->[0])
+	{
+	print $err "keyfilterctl: toggle takes one profile name\n" ;
+	
+	return 1 ;
+	}
+
+my $name = $arguments->[0] ;
+
+if ($name =~ /[\s#]/)
+	{
+	print $err "keyfilterctl: a profile name cannot contain a space or a #\n" ;
+	
+	return 1 ;
+	}
+
+if ($name eq KeyFilter::Chain::runtime_name() || $name eq KeyFilter::Chain::command_line_name())
+	{
+	print $err "keyfilterctl: reserved profile name '$name'\n" ;
+	
+	return 1 ;
+	}
+
+my $line = "toggle $name" ;
+
+return 1 unless check_line($line, $err) ;
+
+return deliver($line, $out, $err, $dir, $pid) ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub command_ls
+{
+my ($arguments, $out, $err, $dir) = @_ ;
+
+if (@$arguments)
+	{
+	print $err "keyfilterctl: ls takes no argument\n" ;
+	
+	return 1 ;
+	}
+
+for my $instance (KeyFilter::Control::instances($dir))
+	{
+	print $out "$instance->{pid} " . ($instance->{info}{command} // '(unknown)') . "\n" ;
+	}
+
+return 0 ;
+}
+
+# -----------------------------------------------------------------------------
+
+sub run
+{
+my (%arguments) = @_ ;
+
+my @argv = @{$arguments{argv} // []} ;
+my $out  = $arguments{stdout} // \*STDOUT ;
+my $err  = $arguments{stderr} // \*STDERR ;
+my $dir  = $arguments{dir} ;
+
+my $pid ;
+
+while (@argv && $argv[0] =~ /\A-/)
+	{
+	my $option = shift @argv ;
+	
+	if ($option eq '-h' || $option eq '--help')
+		{
+		print $out help_text() ;
+		
+		return 0 ;
+		}
+	
+	if ($option eq '--')
+		{
+		last ;
+		}
+	
+	if ($option eq '-p' || $option eq '--pid' || $option =~ /\A--pid=/)
+		{
+		my ($value) = $option =~ /\A--pid=(.*)\z/s ;
+		
+		$value = shift @argv unless defined $value ;
+		
+		if (!defined $value || $value !~ /\A\d+\z/ || $value == 0)
+			{
+			print $err "keyfilterctl: option '--pid' needs a pid\n" ;
+			
+			return 1 ;
+			}
+		
+		$pid = $value + 0 ;
+		
+		next ;
+		}
+	
+	print $err "keyfilterctl: unknown option '$option'\n" ;
+	
+	return 1 ;
+	}
+
+if (!@argv)
+	{
+	print $err usage() ;
+	
+	return 1 ;
+	}
+
+my $name   = shift @argv ;
+my $method = $COMMAND{$name} ;
+
+if (!$method)
+	{
+	print $err "keyfilterctl: unknown command '$name'\n" ;
+	
+	return 1 ;
+	}
+
+no strict 'refs' ;
+
+return &{$method}(\@argv, $out, $err, $dir, $pid) ;
+}
+
+# -----------------------------------------------------------------------------
+
+package KeyFilter::CLI ;
+
+use File::Basename () ;
+
+our $VERSION = '0.01' ;
+
+my %FLAG_OPTION =
+	(
+	'--discover'  => 'discover',
+	'--fast'      => 'fast',
+	'--help'      => 'help',
+	'--version'   => 'version',
+	'--no-socket' => 'no_socket',
+	) ;
+
+my %VALUE_OPTION =
+	(
+	'--replay'  => 'replay',
+	'--record'  => 'record',
+	'--profile' => 'profile',
+	) ;
+
+my %COMMAND_OPTION =
+	(
+	'--block'         => 'block',
+	'--unblock'       => 'unblock',
+	'--map'           => 'map',
+	'--startup-delay' => 'startup-delay',
+	'--send-startup'  => 'send-startup',
+	) ;
+
+#--#
+
+sub usage
+{
+return "Usage: keyfilter [options] -- command [args...]\nTry 'keyfilter --help' for more information.\n" ;
+}
+
+#--#
+
+sub help_text
+{
+return <<'HELP' ;
+Usage: keyfilter [options] [--] command [args...]
+       keyfilter --discover
+       keyfilter --replay FILE [--fast]
+       keyfilter -h | --help | --version
+
+Run a command in a pseudo terminal and filter the keys typed to it.
+
+Rules, each can be given several times, they apply in the order given:
+      --block KEYS            block the keys
+      --unblock KEYS          unblock the keys
+      --map KEY=REPLACEMENT   replace a key by text and keys
+      --profile NAME          load a profile, a name or a path
+
+Startup:
+      --startup-delay MS      wait this many milliseconds, then
+      --send-startup TEXT     send the text to the command
+
+Recording:
+      --record FILE           record the session in FILE
+      --replay FILE           replay a recording
+      --fast                  replay without the recorded pauses
+
+Other:
+      --discover              show what the keys of the terminal send
+      --no-socket             do not create the control socket
+  -h, --help                  show this help
+      --version               show the version
+
+Keys are written a, C-a, M-a, S-Tab, C-M-Up, F5, Enter, Esc, Space, or as
+hexadecimal bytes such as 1b5b41. A replacement is text, with \n, \t, \e,
+\\, \#, \xHH, and keys between << and >>, for example <<Enter>>.
+
+Examples:
+  keyfilter --block C-z -- bash
+  keyfilter --map M-b=<<C-t>> -- bash
+  keyfilter --map F5='git status\n' -- bash
+  keyfilter --profile common --profile vim -- vim
+  keyfilter --startup-delay 500 --send-startup 'source env.sh\n' -- bash
+
+A running instance is controlled with keyfilterctl, see keyfilterctl --help.
+Profiles are in ~/.config/keyfilter, sockets in ~/.config/keyfilter/sockets.
+See keyfilter(1) for the whole description.
+HELP
+}
+
+#--#
+
+sub parse_arguments
+{
+my (@arguments) = @_ ;
+
+my %options = (command => []) ;
+
+while (@arguments)
+	{
+	my $argument = $arguments[0] ;
+	
+	if ($argument eq '--')
+		{
+		shift @arguments ;
+		
+		$options{command} = [ @arguments ] ;
+		
+		last ;
+		}
+	
+	if ($argument eq '-h')
+		{
+		shift @arguments ;
+		
+		$options{help} = 1 ;
+		
+		next ;
+		}
+	
+	if ($argument !~ /\A--./)
+		{
+		$options{command} = [ @arguments ] ;
+		
+		last ;
+		}
+	
+	shift @arguments ;
+	
+	my ($name, $value) = $argument =~ /\A(--[^=]+)(?:=(.*))?\z/s ;
+	
+	if (exists $FLAG_OPTION{$name})
+		{
+		die "option '$name' takes no value\n" if defined $value ;
+		
+		$options{$FLAG_OPTION{$name}} = 1 ;
+		
+		next ;
+		}
+	
+	die "unknown option '$name'\n" unless exists $VALUE_OPTION{$name} || exists $COMMAND_OPTION{$name} ;
+	
+	$value = shift @arguments if !defined $value && @arguments ;
+	
+	die "option '$name' needs a value\n" unless defined $value ;
+	
+	if (exists $COMMAND_OPTION{$name})
+		{
+		die "option '$name': the value cannot contain a line end, write \\n\n" if $value =~ /[\r\n]/ ;
+		
+		my $command = eval { scalar KeyFilter::Command::parse_command("$COMMAND_OPTION{$name} $value") ; } ;
+		
+		if ($@)
+			{
+			(my $message = $@) =~ s/\n\z// ;
+			
+			die "option '$name': $message\n" ;
+			}
+		
+		die "option '$name' needs a value\n" unless $command ;
+		
+		push @{$options{commands}}, $command ;
+		}
+	elsif ($name eq '--profile')
+		{
+		die "option '--profile' needs a value\n" unless length $value ;
+		
+		push @{$options{profiles}}, $value ;
+		}
+	else
+		{
+		$options{$VALUE_OPTION{$name}} = $value ;
+		}
+	}
+
+return \%options if $options{help} || $options{version} ;
+
+if ($options{discover})
+	{
+	die "--discover cannot be used with other options or a command\n" if @{$options{command}} || grep { $_ ne 'discover' && $_ ne 'command' } keys %options ;
+	}
+
+die "--fast can only be used with --replay\n" if $options{fast} && !defined $options{replay} ;
+
+if (defined $options{replay})
+	{
+	die "--replay does not run a command\n" if @{$options{command}} ;
+	die "--replay cannot be used with --record\n" if defined $options{record} ;
+	die "--replay cannot be used with rules, profiles or startup options\n" if $options{profiles} || $options{commands} || $options{no_socket} ;
+	}
+
+return \%options ;
+}
+
+#--#
+
+sub control_for
+{
+my ($options, $profiles) = @_ ;
+
+my %info =
+	(
+	command  => join(' ', @{$options->{command}}),
+	started  => time,
+	profiles => join(' ', map { $_->name() } @$profiles),
+	) ;
+
+my $control = eval { KeyFilter::Control->new(info => \%info) ; } ;
+
+if (!$control)
+	{
+	(my $message = $@) =~ s/\n\z// ;
+	
+	print STDERR "keyfilter: no control socket: $message\n" ;
+	}
+
+return $control ;
+}
+
+#--#
+
+sub run_command
+{
+my ($options) = @_ ;
+
+my @profiles = KeyFilter::Profile::load_profiles(@{$options->{profiles} // []}) ;
+my $chain    = KeyFilter::Chain->new(profiles => \@profiles, command_line => $options->{commands} // []) ;
+
+my %arguments = (command => $options->{command}, chain => $chain, startup => $chain->startup()) ;
+
+$arguments{recorder} = KeyFilter::Recorder->new(file => $options->{record}) if defined $options->{record} ;
+$arguments{control}  = control_for($options, \@profiles) unless $options->{no_socket} ;
+
+return KeyFilter::PTY->new(%arguments)->run() ;
+}
+
+#--#
+
+sub wants_help
+{
+my (@arguments) = @_ ;
+
+while (@arguments)
+	{
+	my $argument = shift @arguments ;
+	
+	return 0 if $argument eq '--' || $argument !~ /\A-/ ;
+	
+	return 1 if $argument eq '-h' || $argument eq '--help' ;
+	
+	shift @arguments if exists $VALUE_OPTION{$argument} || exists $COMMAND_OPTION{$argument} ;
+	}
+
+return 0 ;
+}
+
+#--#
+
+sub main
+{
+my (@arguments) = @_ ;
+
+return KeyFilter::Ctl::run(argv => \@arguments) if File::Basename::basename($0) eq 'keyfilterctl' ;
+
+if (wants_help(@arguments))
+	{
+	print help_text() ;
+	
+	return 0 ;
+	}
+
+my $options = eval { parse_arguments(@arguments) ; } ;
+
+if (!$options)
+	{
+	print STDERR "keyfilter: $@" ;
+	
+	return 1 ;
+	}
+
+if ($options->{version})
+	{
+	print "keyfilter $VERSION\n" ;
+	
+	return 0 ;
+	}
+
+return KeyFilter::Discovery::run() if $options->{discover} ;
+
+if (defined $options->{replay})
+	{
+	my $code = eval { KeyFilter::Replayer->new(file => $options->{replay}, fast => $options->{fast})->run() ; } ;
+	
+	return $code if defined $code ;
+	
+	print STDERR "keyfilter: $@" ;
+	
+	return 255 ;
+	}
+
+if (!@{$options->{command}})
+	{
+	print STDERR usage() ;
+	
+	return 1 ;
+	}
+
+my $code = eval { run_command($options) ; } ;
+
+if (!defined $code)
+	{
+	print STDERR "keyfilter: $@" ;
+	
+	return 255 ;
+	}
+
+return $code ;
+}
+
+# -----------------------------------------------------------------------------
+
+exit KeyFilter::CLI::main(@ARGV) unless caller ;
+
+1 ;
